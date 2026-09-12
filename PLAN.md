@@ -2,7 +2,7 @@
 
 ## 1. 产品目标
 
-在当前工作区创建仅手动触发的 Codex skill：`circle`。
+在当前工作区创建 Codex skill：`circle`。初始化必须通过 `$circle /init` 显式触发；工作区已经安装 `.circle/` 后，允许通过明确的自然语言项目管理请求隐式触发。
 
 用户通过 `$circle` 提供项目 Markdown 或纯文本。Circle 将内容归一化为项目文档、独立 Issue 文件和依赖 DAG，并提供项目状态及 Issue 维护命令。
 
@@ -170,10 +170,11 @@ Issue 进入 `in_progress` 或 `done` 前，所有 blocker 必须已经为 `done
 
 ## 6. 命令接口
 
-所有命令都通过 `$circle` 显式触发：
+初始化只能通过 `$circle /init` 显式触发。Preview 来自显式初始化后，用户下一轮的明确确认视为同一初始化流程的延续，无需重复 `$circle`。工作区已经存在 `.circle/` 后，以下命令既可显式调用，也可由明确的自然语言项目管理请求触发：
 
 ```text
 $circle /init <文档路径或粘贴内容>
+$circle /commit <snapshot-hash>
 $circle /status
 $circle /render
 
@@ -187,7 +188,7 @@ $circle /dependency add <issue-id> <blocker-id>
 $circle /dependency remove <issue-id> <blocker-id>
 ```
 
-`/init` 分为 Preview 和 Commit 两次交互，但 Commit 使用 Preview 已生成的快照。
+`/init` 分为 Preview 和 Commit 两次交互。用户可以直接确认 Preview，也可以显式调用 `/commit <snapshot-hash>`；两种方式都必须使用 Preview 已生成的快照。
 
 任何包含多个文件的操作都必须先完成全部校验，再进行原子写入。
 
@@ -236,7 +237,7 @@ Git 历史作为 v1 的变更记录，不额外维护集中式事件日志。
 ## 9. 实现与版本边界
 
 - skill 源码创建在当前工作区的 `circle/`。
-- 使用 `agents/openai.yaml` 设置 `allow_implicit_invocation: false`。
+- 使用 `agents/openai.yaml` 设置 `allow_implicit_invocation: true`，由 `SKILL.md` 强制“未安装时仅显式 `/init`，安装后允许隐式管理”的条件式触发策略。
 - 使用无第三方依赖的 Python 脚本实现确定性数据更新和校验。
 - v2 可升级为 plugin，提供更正式的命令和交互能力。
 - v3 再引入 Linear，并为本地 CIR ID 与 Linear Issue ID 建立显式映射。

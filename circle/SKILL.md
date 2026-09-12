@@ -1,6 +1,6 @@
 ---
 name: circle
-description: Control a local Markdown project with independent CIR issues and a dependency DAG. Use only when the user explicitly invokes `$circle` to import a project document, preview or commit a Circle project, inspect project status, maintain issues, change issue lifecycle state, add or remove dependencies, validate the fact store, or render its Mermaid DAG.
+description: Control a local Markdown project with independent CIR issues and a dependency DAG. Require an explicit `$circle /init` to initialize a workspace. When the workspace already contains `.circle/`, use this skill for explicit `$circle` commands or clear natural-language requests to inspect project status, maintain issues, change lifecycle state, manage dependencies, validate the fact store, or render its Mermaid DAG. Also use it to continue an unambiguous confirmation of a Preview started by an explicit Circle initialization.
 ---
 
 # Circle
@@ -9,7 +9,10 @@ Manage the `.circle/` fact store with the deterministic `scripts/circle.py` cont
 
 ## Invocation contract
 
-- Act only on explicit `$circle` invocation.
+- If `.circle/` does not exist, start initialization only when the user explicitly invokes `$circle /init`. Never infer initialization from a general project-management request.
+- Treat an unambiguous confirmation or rejection of a Preview produced by an explicit `$circle /init` in this conversation as part of that same explicit initialization. Do not require the user to repeat `$circle`. On confirmation, commit only the displayed snapshot hash and project root; on rejection, leave the workspace unchanged.
+- Accept `$circle /commit <snapshot-hash>` before installation only when it refers to a Preview previously produced by an explicit `$circle /init` for the same project root.
+- If `.circle/` exists, handle both explicit `$circle` commands and clear natural-language requests to manage that Circle project. Do not interpret requests to execute project work as Circle management commands.
 - Treat `.circle/PROJECT.md` and `.circle/issues/*.md` as facts. Treat `.circle/DAG.md` as a derived view.
 - Run all controller commands with `python3 <skill-dir>/scripts/circle.py`.
 - Pass the user's current workspace as `--project-root`.
@@ -21,14 +24,16 @@ Manage the `.circle/` fact store with the deterministic `scripts/circle.py` cont
 Map user commands to controller subcommands:
 
 ```text
-/status                              status
-/render                              render
-/validate                            validate
-/issue list                          issue-list
-/issue show <id>                     issue-show --id <id>
-/issue transition <id> <state>       issue-transition --id <id> --state <state>
-/dependency add <issue> <blocker>    dependency-add --id <issue> --blocker <blocker>
-/dependency remove <issue> <blocker> dependency-remove --id <issue> --blocker <blocker>
+/init <document or pasted text>       normalize input, then preview
+/commit <snapshot-hash>               commit --snapshot <snapshot-hash>
+/status                               status
+/render                               render
+/validate                             validate
+/issue list                           issue-list
+/issue show <id>                      issue-show --id <id>
+/issue transition <id> <state>        issue-transition --id <id> --state <state>
+/dependency add <issue> <blocker>     dependency-add --id <issue> --blocker <blocker>
+/dependency remove <issue> <blocker>  dependency-remove --id <issue> --blocker <blocker>
 ```
 
 For every mutation of an existing issue, first read it with `issue-show`, take its current `revision`, and pass that value as `--expected-revision`. Pass an optional transition note with `--note`.
@@ -89,8 +94,8 @@ Accept loosely structured input. Infer fields from titles or context only when t
 Use `null` for unknown assignee or estimate and `[]` for no dependencies. Record every inferred field in `inferences`. Do not invent an ambiguous dependency: stop and ask the user to resolve it.
 
 1. Pipe the normalized JSON to `preview`. The controller allocates permanent IDs, resolves temporary keys, validates the graph, saves a snapshot outside the target repository, and prints the Preview plus a snapshot hash.
-2. Present the Preview and ask for confirmation. Do not modify the target project before confirmation.
-3. After confirmation, run `commit --snapshot <hash>` using the printed hash and the same project root. Do not parse the source input again. If the snapshot is absent or invalid, request a new Preview.
+2. Present the Preview and ask for confirmation. State that a plain, unambiguous confirmation is sufficient; `$circle /commit <hash>` is also accepted. Do not modify the target project before confirmation.
+3. After an unambiguous confirmation, run `commit --snapshot <hash>` using the hash shown in that Preview and the same project root. Treat this as continuation of the original explicit initialization even when the confirmation does not repeat `$circle`. Do not parse the source input again. If the snapshot is absent or invalid, request a new explicit `$circle /init` Preview.
 
 ## Interpret status
 
