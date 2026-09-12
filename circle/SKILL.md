@@ -60,6 +60,32 @@ Parse the user's import input exactly once. Normalize it into this JSON shape:
 }
 ```
 
+When the user needs a starting point, provide this Chinese Markdown template:
+
+```markdown
+# 项目名称
+
+项目介绍。
+
+## Issue: 实现数据模型
+key: data-model
+blocked_by: none
+estimate: 2 days
+assignee: Alice
+
+定义项目和 Issue 的存储结构。
+
+## Issue: 生成 DAG
+key: dag-render
+blocked_by: data-model
+estimate: 1 day
+assignee: Bob
+
+根据 Issue 依赖生成 DAG。
+```
+
+Accept loosely structured input. Infer fields from titles or context only when the result is unambiguous, list every inference in the Preview, and ask the user to resolve ambiguous dependencies before running `preview`.
+
 Use `null` for unknown assignee or estimate and `[]` for no dependencies. Record every inferred field in `inferences`. Do not invent an ambiguous dependency: stop and ask the user to resolve it.
 
 1. Pipe the normalized JSON to `preview`. The controller allocates permanent IDs, resolves temporary keys, validates the graph, saves a snapshot outside the target repository, and prints the Preview plus a snapshot hash.
@@ -68,10 +94,14 @@ Use `null` for unknown assignee or estimate and `[]` for no dependencies. Record
 
 ## Interpret status
 
+- Advance issues only along `draft → ready → in_progress → review → done`.
+- Allow any non-terminal issue to transition to `cancelled`; restore `cancelled` only to `draft`.
 - `blocked`: at least one blocker is not `done`.
 - `unblocked`: every blocker is `done`.
 - `actionable`: state is `ready` and the issue is unblocked.
 - `done` is terminal. Create a correction issue for later omissions or mistakes.
 - A cancelled blocker remains blocking until restored and completed.
+
+After resolving a Git merge conflict in Circle facts, run `validate`; tell the user that `/render` is also required to refresh the DAG.
 
 After a successful mutation, summarize the changed issue ID, new revision, and any newly actionable issues reported by the controller.

@@ -296,7 +296,7 @@ def normalize_import(raw: dict[str, Any], root: Path) -> dict[str, Any]:
         raise CircleError("import requires a project object and at least one issue")
     normalized_project = {
         "name": normalize_text(project.get("name"), "project.name"),
-        "description": normalize_text(project.get("description", ""), "project.description", nullable=True) or "",
+        "description": normalize_body(project.get("description", ""), "project.description"),
     }
     ids: set[str] = set()
     key_map: dict[str, str] = {}
@@ -408,13 +408,19 @@ def render_preview(snapshot: dict[str, Any]) -> str:
     description = snapshot["project"]["description"]
     if description:
         lines.extend([description, ""])
-    lines.extend(["| ID | key | Issue | blocked_by | assignee | estimate |", "|---|---|---|---|---|---|"])
+    lines.extend([
+        "| ID | key | Issue | state | blocked_by | assignee | estimate | revision |",
+        "|---|---|---|---|---|---|---|---|",
+    ])
     for issue in snapshot["issues"]:
         blockers = ", ".join(issue["blocked_by"]) or "—"
         lines.append(
-            f"| {issue['id']} | {issue['key']} | {issue['title']} | {blockers} | "
-            f"{issue['assignee'] or '—'} | {issue['estimate'] or '—'} |"
+            f"| {issue['id']} | {issue['key']} | {issue['title']} | {issue['state']} | {blockers} | "
+            f"{issue['assignee'] or '—'} | {issue['estimate'] or '—'} | {issue['revision']} |"
         )
+    lines.extend(["", f"Created at: `{snapshot['created_at']}`", "", "## Execution details", ""])
+    for issue in snapshot["issues"]:
+        lines.extend([f"### {issue['id']}: {issue['title']}", "", issue["body"] or "—", ""])
     for label in ("inferences", "warnings"):
         values = snapshot[label]
         if values:
@@ -590,7 +596,9 @@ def cmd_issue_add(args: argparse.Namespace) -> None:
         issues[issue["id"]] = issue
         validate_graph(issues)
         write_issue(args.project_root / ".circle" / "issues" / f"{issue['id']}.md", issue)
-    print(json.dumps(issue_view(issue, issues), ensure_ascii=False, indent=2))
+    output = issue_view(issue, issues)
+    output["newly_actionable"] = [issue["id"]] if output["actionable"] else []
+    print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
 def cmd_issue_edit(args: argparse.Namespace) -> None:

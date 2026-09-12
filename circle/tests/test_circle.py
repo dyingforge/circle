@@ -139,6 +139,99 @@ class CircleFlowTest(unittest.TestCase):
         self.assertIn("unknown blocker key", result.stderr)
         self.assertFalse((self.root / ".circle").exists())
 
+    def test_preview_is_complete_and_commit_rejects_tampered_snapshot(self):
+        payload = {
+            "project": {"name": "Preview", "description": "Inspect before commit."},
+            "issues": [{
+                "key": "first", "title": "First", "body": "Visible execution detail.",
+                "blocked_by": [], "estimate": None, "assignee": None,
+            }],
+            "inferences": ["项目名称来自一级标题"],
+            "warnings": ["未提供负责人"],
+            "raw_summary": "One issue project",
+        }
+        preview = self.run_circle("preview", data=payload)
+        self.assertIn("| ID | key | Issue | state |", preview.stdout)
+        self.assertIn("Visible execution detail.", preview.stdout)
+        self.assertIn("项目名称来自一级标题", preview.stdout)
+        self.assertIn("未提供负责人", preview.stdout)
+        self.assertFalse((self.root / ".circle").exists())
+
+        digest = re.search(r"Snapshot: `([0-9a-f]{64})`", preview.stdout).group(1)
+        snapshot_path = Path(tempfile.gettempdir()) / "circle-preview-snapshots" / f"{digest}.json"
+        snapshot = json.loads(snapshot_path.read_text())
+        snapshot["project"]["name"] = "Tampered"
+        snapshot_path.write_text(json.dumps(snapshot))
+        try:
+            rejected = self.run_circle("commit", "--snapshot", digest, success=False)
+            self.assertIn("snapshot hash mismatch", rejected.stderr)
+            self.assertFalse((self.root / ".circle").exists())
+        finally:
+            snapshot_path.unlink(missing_ok=True)
+
+    def test_import_rejects_duplicate_and_invalid_dependency_graphs(self):
+        cases = [
+            (
+                "duplicate issue key",
+                [
+                    {"key": "same", "title": "One", "blocked_by": []},
+                    {"key": "same", "title": "Two", "blocked_by": []},
+                ],
+            ),
+            (
+                "duplicate issue title",
+                [
+                    {"key": "one", "title": "Same", "blocked_by": []},
+                    {"key": "two", "title": "same", "blocked_by": []},
+                ],
+            ),
+            (
+                "self dependency",
+                [{"key": "self", "title": "Self", "blocked_by": ["self"]}],
+            ),
+            (
+                "dependency cycle",
+                [
+                    {"key": "one", "title": "One", "blocked_by": ["two"]},
+                    {"key": "two", "title": "Two", "blocked_by": ["one"]},
+                ],
+            ),
+        ]
+        for message, issues in cases:
+            with self.subTest(message=message):
+                payload = {"project": {"name": "Invalid"}, "issues": issues}
+                rejected = self.run_circle("preview", data=payload, success=False)
+                self.assertIn(message, rejected.stderr)
+                self.assertFalse((self.root / ".circle").exists())
+
+    def test_cancelled_blocker_stays_blocking(self):
+        ids = self.import_three_issues()
+        model, dag = ids["model"], ids["dag"]
+        self.transition(dag, "ready", 1)
+        self.transition(model, "cancelled", 1)
+        shown = json.loads(self.run_circle("issue-show", "--id", dag).stdout)
+        self.assertEqual("blocked", shown["dependency_status"])
+        self.assertFalse(shown["actionable"])
+
+    def test_issue_mutations_do_not_implicitly_render_dag(self):
+        ids = self.import_three_issues()
+        before = (self.root / ".circle" / "DAG.md").read_text()
+        added = json.loads(self.run_circle(
+            "issue-add", data={"title": "Independent", "state": "ready"},
+        ).stdout)
+        self.assertEqual([added["id"]], added["newly_actionable"])
+        self.assertEqual(before, (self.root / ".circle" / "DAG.md").read_text())
+
+        self.run_circle(
+            "dependency-add", "--id", added["id"], "--blocker", ids["model"],
+            "--expected-revision", "1",
+        )
+        self.assertEqual(before, (self.root / ".circle" / "DAG.md").read_text())
+        self.run_circle("render")
+        rendered = (self.root / ".circle" / "DAG.md").read_text()
+        self.assertIn(added["id"], rendered)
+        self.assertNotEqual(before, rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
