@@ -36,6 +36,7 @@ ARCHITECTURE_DOC = "ARCHITECTURE.md"
 DOMAIN_DOC = "DOMAIN.md"
 DAG_DOC = "DAG.md"
 DOCUMENTS = (("agent", AGENT_DOC), ("architecture", ARCHITECTURE_DOC), ("domain", DOMAIN_DOC))
+DOC_FILENAMES = dict(DOCUMENTS)
 SUPPORTING_DOCS = (ARCHITECTURE_DOC, DOMAIN_DOC)
 
 DRAFT = "draft"
@@ -67,6 +68,15 @@ CREATION_FIELDS = EDITABLE_FIELDS + ("state",)
 IMPORT_FIELDS = ("key",) + CREATION_FIELDS
 
 ACCEPTANCE_PATTERN = re.compile(r"^[-*]\s+\[( |x|X)\]\s+(.*)$")
+
+PLACEHOLDER_MARKER = "<!-- circle:placeholder -->"
+# Placeholder text written before the marker existed, so stores created by an
+# earlier version are still reported by `placeholder_documents`.
+LEGACY_PLACEHOLDER_TEXTS = (
+    "TODO: 补充本项目的协作约定与实现规范。",
+    "TODO: 补充Architecture相关内容。",
+    "TODO: 补充Domain相关内容。",
+)
 
 
 def now() -> str:
@@ -193,6 +203,17 @@ def parse_acceptance(raw: str, path: Path) -> list[dict[str, Any]]:
 # Issue documents
 # --------------------------------------------------------------------------
 
+def acceptance_indices(issue: dict[str, Any], requested: list[int]) -> set[int]:
+    """Validate 1-based acceptance item numbers against one issue."""
+    total = len(issue["acceptance"])
+    for index in requested:
+        if index < 1 or index > total:
+            raise CircleError(
+                f"acceptance item out of range: {index}; {issue['id']} has {total} items"
+            )
+    return set(requested)
+
+
 def issue_fields(issue: dict[str, Any]) -> list[tuple[str, Any]]:
     return [(field, issue[field]) for field in FRONT_MATTER_FIELDS]
 
@@ -291,6 +312,23 @@ def load_project(store: Path) -> dict[str, Any]:
         if not (store / doc).is_file():
             raise CircleError(f"missing required document: {STORE_DIR}/{doc}")
     return {"name": name, "created_at": fields["created_at"], "agent": body}
+
+
+def placeholder_documents(store: Path) -> list[str]:
+    """File names of the project documents still holding placeholder content.
+
+    Reads the files directly rather than the loaded model, so a document that is
+    malformed in some other way is still reported instead of raising.
+    """
+    result: list[str] = []
+    for doc in (AGENT_DOC,) + SUPPORTING_DOCS:
+        try:
+            text = (store / doc).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        if PLACEHOLDER_MARKER in text or any(item in text for item in LEGACY_PLACEHOLDER_TEXTS):
+            result.append(doc)
+    return result
 
 
 def load_store(store: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:

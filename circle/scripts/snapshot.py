@@ -20,6 +20,7 @@ from errors import CircleError
 from model import (
     ACCEPTANCE_SECTION,
     DOCUMENTS,
+    PLACEHOLDER_MARKER,
     PROSE_SECTIONS,
     normalize_body,
     normalize_issue_batch,
@@ -77,12 +78,12 @@ def load_snapshot(value: str, root: Path) -> tuple[dict[str, Any], Path]:
 
 
 def default_agent_doc() -> str:
-    return "## 工作约定\n\nTODO: 补充本项目的协作约定与实现规范。"
+    return f"{PLACEHOLDER_MARKER}\n\n## 工作约定\n\nTODO: 补充本项目的协作约定与实现规范。"
 
 
 def default_document(name: str, kind: str) -> str:
     label = kind.title()
-    return f"# {name}: {label}\n\nTODO: 补充{label}相关内容。\n"
+    return f"{PLACEHOLDER_MARKER}\n\n# {name}: {label}\n\nTODO: 补充{label}相关内容。\n"
 
 
 def compose_agent_body(description: str, agent_doc: str) -> str:
@@ -90,7 +91,9 @@ def compose_agent_body(description: str, agent_doc: str) -> str:
     return "\n\n".join(parts)
 
 
-def normalize_import(raw: dict[str, Any], root: Path) -> dict[str, Any]:
+def normalize_import(
+    raw: dict[str, Any], root: Path, allow_placeholder_docs: bool = False
+) -> dict[str, Any]:
     unknown = sorted(set(raw) - set(IMPORT_KEYS))
     if unknown:
         raise CircleError(f"unknown import fields: {', '.join(unknown)}")
@@ -110,15 +113,24 @@ def normalize_import(raw: dict[str, Any], root: Path) -> dict[str, Any]:
     if unknown:
         raise CircleError(f"unknown docs fields: {', '.join(unknown)}")
     resolved: dict[str, str] = {}
-    for field, _ in DOCUMENTS:
+    missing: list[tuple[str, str]] = []
+    for field, doc in DOCUMENTS:
         value = docs.get(field)
         if value is None or not str(value).strip():
             resolved[field] = (
                 default_agent_doc() if field == "agent" else default_document(name, field)
             )
-            inferences.append(f"docs.{field} 未提供，已写入占位内容")
+            missing.append((field, doc))
         else:
             resolved[field] = normalize_body(value, f"docs.{field}")
+    if missing and not allow_placeholder_docs:
+        raise CircleError(
+            "missing project documents: "
+            + ", ".join(doc for _, doc in missing)
+            + "; ask the user for their content, or pass --allow-placeholder-docs to "
+            "accept TODO placeholders"
+        )
+    inferences.extend(f"docs.{field} 未提供，已写入占位内容" for field, _ in missing)
 
     snapshot = {
         "schema_version": SCHEMA_VERSION,

@@ -128,7 +128,7 @@ Preview 直接从该快照渲染。
 - Issue 更新时不自动修改 `DAG.md`；只有 `/render` 显式重建，避免多人修改不同 Issue 时都冲突同一个 DAG 文件。
 - 执行某个 Issue 时只需要这四份文档，上下文因此是可控且确定的。
 
-三份整体文档在初始化时由输入提供；未提供时控制器写入占位内容，并记入 Preview 的推断说明。
+三份整体文档都必须在初始化时由输入完整提供。缺少任何一份时控制器拒绝生成 Preview 并点名缺少的文件，由 Skill 先向用户索要内容，而不是自己补写。只有用户明确放弃提供时，才用 `--allow-placeholder-docs` 写入带 `<!-- circle:placeholder -->` 标记的占位内容并记入 Preview 的推断说明；此后 `/status` 与 `/validate` 会持续报告仍未填充的文档。初始化之后用 `/docs set <agent|architecture|domain>` 替换任意一份文档的正文，控制器负责写 `AGENT.md` 的 front matter。
 
 ## 4. Issue 数据模型
 
@@ -169,6 +169,7 @@ updated_at: "..."
 
 - 四个内容小节缺失或为空都会被拒绝，控制器不接受只有标题的 Issue。
 - `## Acceptance Criteria` 是唯一的验收来源，执行时必须逐项核对。
+- 验收项可以按 1-based 序号用 `/acceptance check`、`/acceptance uncheck` 逐项勾选；`/issue edit` 仍然整组替换。
 - 只有 `## Comments` 是可选的额外小节，由 `--note` 追加；其他未知小节会被拒绝。
 - `assignee` 是普通名称字符串，可以为空。
 - 不保存工期字段：估算格式校验与计算明确不在 Circle 的职责内。
@@ -198,7 +199,7 @@ draft → ready → in_progress → review → done
 
 > 任意 `done` Issue 的所有 blocker 永远保持为 `done`。
 
-Issue 进入 `in_progress` 或 `done` 前，所有 blocker 必须已经为 `done`。
+Issue 进入 `in_progress` 或 `done` 前，所有 blocker 必须已经为 `done`。进入 `done` 前还要求全部验收项都已勾选，控制器在还有未勾选项时拒绝该次状态流转并列出它们；这条规则只加在状态流转上，不放进事实库装载校验，因此早期留下的、带着未勾选项的 `done` Issue 仍可正常读取。
 
 阻塞状态不保存为生命周期状态，而是从 DAG 计算：
 
@@ -232,6 +233,10 @@ $circle /issue finish <id>
 
 $circle /dependency add <issue-id> <blocker-id>
 $circle /dependency remove <issue-id> <blocker-id>
+
+$circle /acceptance check <id> <item>...
+$circle /acceptance uncheck <id> <item>...
+$circle /docs set <agent|architecture|domain>
 ```
 
 `/init` 分为 Preview 和 Commit 两次交互。用户可以直接确认 Preview，也可以显式调用 `/commit <snapshot-hash>`；两种方式都必须使用 Preview 已生成的快照。
@@ -255,14 +260,15 @@ $circle /issue finish <id>    # 合并回基线分支并删除 circle/<id>
 1. `/issue start` 校验 Issue 未被阻塞、不是 `done`/`cancelled`，且工作树干净。
 2. 从当前分支创建 `circle/<id>`，并把基线分支记录在 `git config branch.circle/<id>.circlebase`。
 3. 打印执行上下文：`AGENT.md`、`ARCHITECTURE.md`、`DOMAIN.md` 与当前 Issue 的完整内容。
-4. agent 在该分支上实现并提交，逐项核对验收标准。
+4. agent 在该分支上实现并提交，逐项核对验收标准，并用 `/acceptance check` 逐项勾选后把这些勾选一并提交到分支上。
 5. `/issue finish` 切回基线分支、合并 `circle/<id>`、删除该分支；分支级 git config 随分支删除自动清理。
+6. agent 用 `/issue transition` 推进到 `done`。
 
 约束：
 
 - 被阻塞的 Issue 不能开始执行。
 - 分支名与基线分支都从 Issue 推导，不引入额外的状态文件；`revision` 仍然只用于检测陈旧写入。
-- 工作树不干净时拒绝开始或结束，避免把无关改动带进合并。
+- 工作树不干净时拒绝开始或结束，避免把无关改动带进合并。勾选验收项也会修改 Issue 文件，因此必须在分支上提交之后才能结束。
 - 合并失败时不留下半合并状态：控制器执行 `git merge --abort` 并保留 `circle/<id>`，要求人工处理后重试。
 - Circle 不自动实现、也不自动验收 Issue；执行和验收的主体始终是 agent。
 - 需要 Git 仓库，且项目根目录必须是该仓库的工作树根目录。
@@ -301,7 +307,9 @@ Git 历史作为变更记录，不额外维护集中式事件日志。
 8. 从后续文档批量新增 Issue，并拒绝未知引用。
 9. 生成 Mermaid DAG。
 10. 为某个 Issue 创建执行分支、提交改动、合并回基线分支，并确认分支已删除。
-11. 完成剩余 Issue，验证项目状态正确。
+11. 逐项勾选验收标准，确认未勾选完时无法进入 `done`，勾选后可以。
+12. 用 `/docs set` 替换一份整体文档，确认 `AGENT.md` 的 front matter 保持不变。
+13. 完成剩余 Issue，验证项目状态正确。
 
 在同一组测试数据上补充最小失败场景：
 
@@ -309,6 +317,8 @@ Git 历史作为变更记录，不额外维护集中式事件日志。
 - 使用陈旧 revision 修改当前工作树中的同一 Issue 时拒绝覆盖。
 - 尝试重新打开或修改 `done` Issue 时拒绝操作。
 - 缺少四个内容小节之一的 Issue 被拒绝导入。
+- 缺少三份整体文档之一的 import 被拒绝并点名缺少的文件；只有显式放弃时才写入占位内容。
+- 勾选越界的验收项序号、重复勾选已勾选项、取消未勾选项时拒绝操作。
 - 工作树不干净或被阻塞时拒绝开始执行。
 - 超长依赖链可以完成环检测，不出现栈溢出。
 
@@ -320,6 +330,6 @@ Git 历史作为变更记录，不额外维护集中式事件日志。
 - 使用 `agents/openai.yaml` 设置 `allow_implicit_invocation: true`，由 `SKILL.md` 强制“未安装时仅显式 `/init`，安装后允许隐式管理”的条件式触发策略。
 - 使用无第三方依赖的 Python 脚本实现确定性数据更新、校验和 Git 分支管理，按关注点拆分为若干模块，入口固定为 `scripts/circle.py`。
 - 执行 Issue 的分支工作流由控制器提供，但实现与验收始终由 agent 完成。
-- 当前版本已包含 `/issue context`、`/issue import`、`/issue start`、`/issue finish` 与整体文档模型。
+- 当前版本已包含 `/issue context`、`/issue import`、`/issue start`、`/issue finish`、`/acceptance check`、`/acceptance uncheck`、`/docs set` 与整体文档模型。
 - 后续可升级为 plugin，提供更正式的命令和交互能力。
 - 再之后引入 Linear，并为本地 CIR ID 与 Linear Issue ID 建立显式映射。

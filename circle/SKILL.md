@@ -35,6 +35,12 @@ Circle controls projects; it does not implement them. You implement an issue whe
 
 `AGENT.md`、`ARCHITECTURE.md`、`DOMAIN.md` 和每个 Issue 文件都是事实源。执行 Issue 时只需要这些文档加上仓库本身。
 
+## Project documents
+
+`AGENT.md`、`ARCHITECTURE.md`、`DOMAIN.md` 在 import 时必须完整提供。仍是占位内容时，`/status` 会在 Documents 行标出 `placeholder`，`/validate` 会给出 Warning。
+
+替换其中一份用 `/docs set <agent|architecture|domain>`，新正文从标准输入读入。控制器负责写 `AGENT.md` 的 `name` 与 `created_at` front matter，你永远不需要手写 front matter。`agent` 的正文是 `AGENT.md` 的完整正文（含项目介绍），因为这两部分在磁盘上是合并存储的。这三份文档没有 revision 守卫，并发冲突由 Git 暴露。
+
 ## Route commands
 
 ```text
@@ -54,6 +60,9 @@ Circle controls projects; it does not implement them. You implement an issue whe
 /issue finish <id>                    issue-finish --id <id> [--into <branch>]
 /dependency add <issue> <blocker>     dependency-add --id <issue> --blocker <blocker>
 /dependency remove <issue> <blocker>  dependency-remove --id <issue> --blocker <blocker>
+/acceptance check <id> <item>...      acceptance-check --id <id> --item <n> [--item <n>]
+/acceptance uncheck <id> <item>...    acceptance-uncheck --id <id> --item <n> [--item <n>]
+/docs set <name>                      docs-set --doc <agent|architecture|domain>
 ```
 
 For every mutation of an existing issue, first read it with `issue-show`, take its current `revision`, and pass that value as `--expected-revision`. Pass an optional transition note with `--note`.
@@ -83,7 +92,7 @@ Every issue carries six content fields. The first four live in the Markdown body
 
 `blocked_by`（前置依赖）和 `assignee`（负责人）保存在 front matter。`## Comments` 是唯一允许的额外小节，由 `--note` 追加；任何其他小节都会被拒绝。
 
-`## Acceptance Criteria` 是唯一的验收来源：执行 Issue 时逐项核对，未满足就不能进入 `done`。
+`## Acceptance Criteria` 是唯一的验收来源。勾选单一项用 `/acceptance check`，取消用 `/acceptance uncheck`，`--item` 是 1-based 的验收项序号（可重复传多个）。控制器强制这条规则：只要还有未勾选项，`issue-transition` 进入 `done` 就会被拒绝并列出它们。勾选已经勾选的项、取消未勾选的项都会被拒绝，读一次 `issue-show` 再操作即可。
 
 ## Import with Preview and Commit
 
@@ -116,7 +125,7 @@ Parse the user's import input exactly once. Normalize it into this JSON shape:
 }
 ```
 
-`docs` 是可选的整体文档设计。未提供时控制器写入占位内容并记入 `inferences`。`state` 只能是 `draft`（默认）或 `ready`。
+`docs` 必须包含全部三份文档的正文。控制器拒绝缺少任何一份的 import，并在错误里点名缺少的文件；这时不要自己补写，先向用户索要。只有当用户明确表示放弃提供时，才加 `--allow-placeholder-docs`，控制器会写入带 `<!-- circle:placeholder -->` 标记的占位内容并记入 `inferences`，此后 `/status` 与 `/validate` 会一直报告它。`state` 只能是 `draft`（默认）或 `ready`。
 
 When the user needs a starting point, provide this Chinese Markdown template:
 
@@ -149,9 +158,9 @@ assignee: Bob
 - [ ] DAG 包含全部 Issue 与依赖边
 ```
 
-Accept loosely structured input. Infer fields from titles or context only when the result is unambiguous, list every inference in the Preview, and ask the user to resolve ambiguous dependencies before running `preview`.
+Accept loosely structured input, but never invent content. Infer *formatting* — where a field goes, a temporary `key`, wording the input already implies — and list every inference in `inferences`. Content is not inferable: if the input does not supply the three documents, or does not state an issue's goal, boundaries or acceptance criteria, stop and ask the user before running `preview`. The same rule applies to `/issue add` and `/issue import`.
 
-Use `null` for an unknown assignee and `[]` for no dependencies. Record every inferred field in `inferences`. Do not invent an ambiguous dependency: stop and ask the user to resolve it.
+Use `null` for an unknown assignee and `[]` for no dependencies. Do not invent an ambiguous dependency: stop and ask the user to resolve it.
 
 1. Pipe the normalized JSON to `preview`. The controller allocates permanent IDs, resolves temporary keys, validates the graph, saves a snapshot outside the target repository, and prints the Preview plus a snapshot hash.
 2. Present the Preview and ask for confirmation. State that a plain, unambiguous confirmation is sufficient; `$circle /commit <hash>` is also accepted. Do not modify the target project before confirmation.
@@ -175,8 +184,9 @@ When the user asks to execute, implement, or start an issue, follow this procedu
 2. Run `issue-branch --id <id>`. It creates `circle/<id>` from the current branch, records the base branch, and prints the execution context.
 3. Read only the documents the context lists: `.circle/AGENT.md`, `.circle/ARCHITECTURE.md`, `.circle/DOMAIN.md`, and the issue file. Use `.circle/AGENT.md` for project conventions and `.circle/DOMAIN.md` for vocabulary. Use `issue-context --id <id>` alone when you only need the bundle without creating a branch.
 4. Implement the issue on that branch and commit there as usual. The controller never implements anything for you.
-5. When every acceptance criterion holds, run `issue-finish --id <id>`. It merges `circle/<id>` back into the branch it was created from and deletes it. Pass `--into <branch>` only when the recorded base branch is gone.
-6. Advance the issue with `issue-transition`, for example `in_progress` → `review` → `done`.
+5. Verify each acceptance criterion and tick it with `acceptance-check --id <id> --item <n> --expected-revision <revision>`, one `--item` per criterion. Commit that change on the branch: ticking edits the issue file, and `issue-finish` refuses to run with uncommitted changes. Ticking before finishing is what carries the checkboxes into the merged result.
+6. Run `issue-finish --id <id>`. It merges `circle/<id>` back into the branch it was created from and deletes it. Pass `--into <branch>` only when the recorded base branch is gone.
+7. Advance the issue with `issue-transition`, for example `in_progress` → `review` → `done`. The transition to `done` is refused while any acceptance criterion is still unchecked.
 
 Rules for this workflow:
 
@@ -193,6 +203,7 @@ Rules for this workflow:
 - `blocked`: at least one blocker is not `done`.
 - `unblocked`: every blocker is `done`.
 - `actionable`: state is `ready` and the issue is unblocked.
+- `done` requires every acceptance criterion to be checked; the controller refuses the transition otherwise.
 - `done` is terminal. Create a correction issue for later omissions or mistakes.
 - A cancelled blocker remains blocking until restored and completed.
 

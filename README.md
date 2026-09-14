@@ -10,6 +10,7 @@ Circle 是一个面向 Codex 的本地项目控制 Skill。它把项目拆成独
 - 初始化前先生成 Preview，确认后才写入工作区
 - 为每个 Issue 分配不可变的 `CIR-XXXXXXXXXX` ID
 - 每个 Issue 记录目标、预期行为、边界、验收标准、依赖和负责人
+- 逐项勾选验收标准，未勾选完不允许进入 `done`
 - 校验未知依赖、自依赖和依赖环
 - 根据依赖自动计算 `blocked`、`unblocked` 和 `actionable`
 - 用 `revision` 检测当前工作树中的陈旧写入
@@ -40,7 +41,11 @@ Circle 负责项目控制，不会连接外部 Issue Tracker。执行 Issue 的�
 - 修改 Issue 后不会自动刷新 DAG，需要显式执行 `/render`，从而减少多人协作时对同一文件的冲突。
 - 执行某个 Issue 时，agent 只需要 `AGENT.md`、`ARCHITECTURE.md`、`DOMAIN.md` 和该 Issue 本身。
 
-`AGENT.md` 的 front matter 固定包含 `name` 和 `created_at`，正文是项目介绍与协作约定。`ARCHITECTURE.md` 与 `DOMAIN.md` 是普通 Markdown 文档；初始化时未提供时，控制器会写入占位内容并在 Preview 的推断中说明。
+`AGENT.md` 的 front matter 固定包含 `name` 和 `created_at`，正文是项目介绍与协作约定。`ARCHITECTURE.md` 与 `DOMAIN.md` 是普通 Markdown 文档。三份文档都必须在 import 时完整提供：控制器会拒绝缺少任何一份的 import 并点名缺少的文件，Codex 会先向你索要内容而不是自己补写。
+
+如果你明确表示放弃提供，可以加 `--allow-placeholder-docs` 让控制器写入占位内容，占位正文带 `<!-- circle:placeholder -->` 标记并记入 Preview 的推断说明。此后 `/status` 的 Documents 行会把这些文档标为 `placeholder`，`/validate` 也会输出 Warning，直到内容被真正填上（早期版本写入的占位内容同样能被识别）。
+
+初始化之后用 `/docs set <agent|architecture|domain>` 替换任意一份文档的正文。控制器负责写 `AGENT.md` 的 front matter，你不需要手写它。
 
 ## Issue 内容模型
 
@@ -80,7 +85,7 @@ updated_at: "..."
 
 `## Comments` 是唯一允许的额外小节，由 `/issue transition --note` 追加；任何其他小节都会被拒绝。
 
-`## Acceptance Criteria` 是唯一的验收来源。执行 Issue 时逐项核对，未全部满足就不能进入 `done`。
+`## Acceptance Criteria` 是唯一的验收来源。执行 Issue 时逐项核对并逐项勾选：`/acceptance check <id> <item>` 勾选，`/acceptance uncheck <id> <item>` 取消，`<item>` 是 1-based 的验收项序号。控制器强制这条规则——只要还有未勾选项，`/issue transition <id> done` 就会被拒绝并列出未勾选项。
 
 ## 工作方式
 
@@ -166,6 +171,14 @@ $circle /issue finish <id>    # 合并回基线分支并删除 circle/<id>
 
 `/issue start` 会拒绝被阻塞的 Issue、`done`/`cancelled` 的 Issue，以及工作树不干净的情况。它同时打印执行上下文：`AGENT.md`、`ARCHITECTURE.md`、`DOMAIN.md` 和当前 Issue 的完整内容。只想查看上下文而不创建分支时使用 `/issue context <id>`。
 
+勾选验收项会修改该 Issue 的事实文件，而 `/issue start` 与 `/issue finish` 都要求工作树干净，所以顺序是固定的：
+
+```text
+实现 → /acceptance check 逐项勾选 → 在分支上 commit → /issue finish → /issue transition done
+```
+
+如果先 finish 再勾选，勾选会变成基线分支上的未提交改动，下一次 `/issue start` 会因为工作树不干净而被拒绝。
+
 需要 Git 仓库，且项目根目录必须是该仓库的工作树根目录。基线分支由 `git config branch.circle/<id>.circlebase` 记录，随分支删除自动清理；也可以用 `/issue finish <id> --into <branch>` 显式指定。
 
 如果合并产生冲突，控制器会执行 `git merge --abort` 回到干净状态，并提示手动处理 `circle/<id>` 后重试，不会留下半合并状态。
@@ -192,6 +205,9 @@ $circle /issue finish <id>    # 合并回基线分支并删除 circle/<id>
 | `$circle /issue finish <id> [--into <branch>]` | 合并并删除该 Issue 的执行分支 |
 | `$circle /dependency add <issue> <blocker>` | 为 Issue 添加前置依赖 |
 | `$circle /dependency remove <issue> <blocker>` | 移除前置依赖 |
+| `$circle /acceptance check <id> <item>...` | 勾选一个或多个验收项 |
+| `$circle /acceptance uncheck <id> <item>...` | 取消勾选验收项 |
+| `$circle /docs set <agent\|architecture\|domain>` | 替换 `AGENT.md`、`ARCHITECTURE.md` 或 `DOMAIN.md` 的正文 |
 
 Issue 修改成功后，Circle 会报告新的 `revision`，并列出因此变为 `actionable` 的 Issue。
 
@@ -216,6 +232,7 @@ draft → ready → in_progress → review → done
 - `cancelled` 只能恢复为 `draft`。
 - `done` 是终态，不能重新打开。
 - Issue 进入 `in_progress` 或 `done` 前，所有 blocker 都必须为 `done`。
+- Issue 进入 `done` 前，全部验收项都必须已勾选。
 - 被取消的 blocker 仍然会阻塞下游 Issue。
 - `ready` 且所有 blocker 均为 `done` 的 Issue 才是 `actionable`。
 - 已完成 Issue 的标题、四个内容小节和依赖不可修改；负责人仍可更新。
@@ -247,9 +264,11 @@ python3 circle/scripts/circle.py --project-root /path/to/project issue-show --id
 python3 circle/scripts/circle.py --project-root /path/to/project issue-context --id CIR-XXXXXXXXXX
 python3 circle/scripts/circle.py --project-root /path/to/project issue-branch --id CIR-XXXXXXXXXX
 python3 circle/scripts/circle.py --project-root /path/to/project issue-finish --id CIR-XXXXXXXXXX
+python3 circle/scripts/circle.py --project-root /path/to/project acceptance-check --id CIR-XXXXXXXXXX --item 1 --expected-revision 2
+python3 circle/scripts/circle.py --project-root /path/to/project docs-set --doc domain < new-domain.md
 ```
 
-注意：控制器的 `preview`、`issue-add`、`issue-import` 和 `issue-edit` 子命令从标准输入读取 JSON；将自由格式文本整理为 JSON 是 Skill 的职责。修改已有 Issue 或依赖的底层命令还要求提供 `--expected-revision`。运行完整帮助：
+注意：控制器的 `preview`、`issue-add`、`issue-import` 和 `issue-edit` 子命令从标准输入读取 JSON，`docs-set` 从标准输入读取文档正文；将自由格式文本整理为 JSON 是 Skill 的职责。修改已有 Issue 或依赖的底层命令还要求提供 `--expected-revision`。`preview` 只有在显式加上 `--allow-placeholder-docs` 时才会接受缺少整体文档的 import。运行完整帮助：
 
 ```bash
 python3 circle/scripts/circle.py --help
@@ -261,7 +280,7 @@ python3 circle/scripts/circle.py --help
 
 - `test_document.py`：front matter 与小节的编解码、原子写入。
 - `test_model.py`：Issue 归一化、结构校验、依赖图不变量、超长依赖链的环检测。
-- `test_commands.py`：以子进程驱动 CLI 的端到端流程，覆盖初始化、快照防篡改、完整状态流转、依赖解除、批量新增 Issue、执行上下文、损坏事实库、Issue 分支的创建/合并/删除、DAG 渲染、陈旧 revision、终态保护与依赖环拒绝。
+- `test_commands.py`：以子进程驱动 CLI 的端到端流程，覆盖初始化、缺少文档时的拒绝与占位内容、快照防篡改、完整状态流转、验收项的增量勾选与 `done` 门禁、文档替换、依赖解除、批量新增 Issue、执行上下文、损坏事实库、Issue 分支的创建/合并/删除、DAG 渲染、陈旧 revision、终态保护与依赖环拒绝。
 
 ```bash
 python3 -m unittest discover -s circle/tests -v

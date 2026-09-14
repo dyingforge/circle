@@ -9,6 +9,7 @@ import sys
 
 import commands
 from errors import CircleError
+from model import DOC_FILENAMES
 
 
 def parser() -> argparse.ArgumentParser:
@@ -32,11 +33,20 @@ def parser() -> argparse.ArgumentParser:
         "issue-finish": commands.cmd_issue_finish,
         "dependency-add": commands.cmd_dependency_add,
         "dependency-remove": commands.cmd_dependency_remove,
+        "acceptance-check": commands.cmd_acceptance_check,
+        "acceptance-uncheck": commands.cmd_acceptance_uncheck,
+        "docs-set": commands.cmd_docs_set,
     }
     for name, handler in handlers.items():
         subs.add_parser(name).set_defaults(function=handler)
 
     subs.choices["commit"].add_argument("--snapshot", required=True)
+    subs.choices["preview"].add_argument(
+        "--allow-placeholder-docs",
+        action="store_true",
+        help="write TODO placeholders instead of requiring all project documents",
+    )
+    subs.choices["docs-set"].add_argument("--doc", choices=tuple(DOC_FILENAMES), required=True)
     for name in ("issue-show", "issue-context", "issue-edit", "issue-branch", "issue-finish"):
         subs.choices[name].add_argument("--id", required=True)
     subs.choices["issue-edit"].add_argument("--expected-revision", type=int, required=True)
@@ -52,6 +62,11 @@ def parser() -> argparse.ArgumentParser:
         sub = subs.choices[name]
         sub.add_argument("--id", required=True)
         sub.add_argument("--blocker", required=True)
+        sub.add_argument("--expected-revision", type=int, required=True)
+    for name in ("acceptance-check", "acceptance-uncheck"):
+        sub = subs.choices[name]
+        sub.add_argument("--id", required=True)
+        sub.add_argument("--item", type=int, action="append", required=True)
         sub.add_argument("--expected-revision", type=int, required=True)
     return result
 

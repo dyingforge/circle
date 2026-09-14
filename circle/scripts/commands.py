@@ -24,6 +24,7 @@ from model import (
     CANCELLED,
     DAG_DOC,
     DOCUMENTS,
+    DOC_FILENAMES,
     DOMAIN_DOC,
     EDITABLE_FIELDS,
     FORWARD,
@@ -31,9 +32,12 @@ from model import (
     ISSUES_DIR,
     STORE_DIR,
     STATES,
+    SUPPORTING_DOCS,
+    acceptance_indices,
     check_revision,
     issue_path,
     issue_view,
+    load_project,
     load_store,
     normalize_acceptance,
     normalize_blockers,
@@ -43,6 +47,7 @@ from model import (
     normalize_text,
     now,
     optional_text,
+    placeholder_documents,
     render_dag,
     require_issue,
     require_store,
@@ -102,7 +107,7 @@ def render_context(root: Path, issue: dict[str, Any]) -> str:
 def cmd_preview(args: argparse.Namespace) -> None:
     if store_path(args.project_root).exists():
         raise CircleError("Circle project already exists")
-    snapshot = normalize_import(json_stdin(), args.project_root)
+    snapshot = normalize_import(json_stdin(), args.project_root, args.allow_placeholder_docs)
     save_snapshot(snapshot)
     print(render_preview(snapshot))
 
@@ -145,6 +150,9 @@ def cmd_commit(args: argparse.Namespace) -> None:
 def cmd_validate(args: argparse.Namespace) -> None:
     _, issues = read_store(args.project_root)
     print(f"Valid Circle project: {len(issues)} issues.")
+    placeholders = placeholder_documents(store_path(args.project_root))
+    if placeholders:
+        print("Warning: placeholder documents: " + ", ".join(placeholders))
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -162,6 +170,11 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"Project: {project['name']} ({'done' if done else 'active'})")
     print(f"Issues: {len(issues)}")
     print("States: " + ", ".join(f"{state}={counts[state]}" for state in STATES if counts[state]))
+    placeholders = placeholder_documents(store_path(args.project_root))
+    print("Documents: " + ", ".join(
+        f"{doc} {'placeholder' if doc in placeholders else 'ok'}"
+        for doc in (AGENT_DOC,) + SUPPORTING_DOCS
+    ))
     print("Actionable: " + (", ".join(sorted(actionable)) or "none"))
     print("Blocked: " + (", ".join(sorted(blocked)) or "none"))
 
@@ -301,6 +314,16 @@ def cmd_issue_transition(args: argparse.Namespace) -> None:
             unfinished = unfinished_blockers(issue, issues)
             if unfinished:
                 raise CircleError(f"unfinished blockers prevent {target}: {', '.join(unfinished)}")
+        if target == "done":
+            unchecked = [
+                f"{index}. {item['text']}"
+                for index, item in enumerate(issue["acceptance"], 1)
+                if not item["done"]
+            ]
+            if unchecked:
+                raise CircleError(
+                    "unchecked acceptance criteria prevent done: " + "; ".join(unchecked)
+                )
         updated = dict(issue)
         updated["state"] = target
         if args.note:
@@ -355,6 +378,77 @@ def cmd_dependency_add(args: argparse.Namespace) -> None:
 
 def cmd_dependency_remove(args: argparse.Namespace) -> None:
     mutate_dependency(args, False)
+
+
+# --------------------------------------------------------------------------
+# Acceptance criteria
+# --------------------------------------------------------------------------
+
+def mutate_acceptance(args: argparse.Namespace, done: bool) -> None:
+    """Tick or untick individual acceptance items, addressed by 1-based number."""
+    root = args.project_root
+    with store_lock(root):
+        _, issues = load_store(require_store(root))
+        issue = require_issue(issues, args.id)
+        before = actionable_ids(issues)
+        check_revision(issue, args.expected_revision)
+        if issue["state"] == "done":
+            raise CircleError("acceptance criteria of a done issue are immutable")
+        selected = acceptance_indices(issue, args.item)
+        settled = sorted(
+            index for index in selected if issue["acceptance"][index - 1]["done"] == done
+        )
+        if settled:
+            state = "checked" if done else "unchecked"
+            raise CircleError(
+                f"acceptance item already {state}: "
+                + ", ".join(str(index) for index in settled)
+            )
+        updated = dict(issue)
+        updated["acceptance"] = [
+            dict(item, done=done) if index in selected else item
+            for index, item in enumerate(issue["acceptance"], 1)
+        ]
+        updated["revision"] += 1
+        updated["updated_at"] = now()
+        issues[args.id] = updated
+        validate_graph(issues)
+        write_issue(root, updated)
+    report(updated, issues, before)
+
+
+def cmd_acceptance_check(args: argparse.Namespace) -> None:
+    mutate_acceptance(args, True)
+
+
+def cmd_acceptance_uncheck(args: argparse.Namespace) -> None:
+    mutate_acceptance(args, False)
+
+
+# --------------------------------------------------------------------------
+# Project documents
+# --------------------------------------------------------------------------
+
+def cmd_docs_set(args: argparse.Namespace) -> None:
+    """Replace one project document's body. Front matter is never hand-written."""
+    body = sys.stdin.read().strip()
+    if not body:
+        raise CircleError("document body must not be empty")
+    root = args.project_root
+    with store_lock(root):
+        store = require_store(root)
+        project = load_project(store)
+        if args.doc == "agent":
+            write_document(
+                store / AGENT_DOC,
+                [("name", project["name"]), ("created_at", project["created_at"])],
+                body,
+            )
+        else:
+            write_text(store / DOC_FILENAMES[args.doc], body)
+        remaining = placeholder_documents(store)
+    print(f"Updated {DOC_FILENAMES[args.doc]}.")
+    print("Placeholder documents remaining: " + (", ".join(remaining) or "none"))
 
 
 # --------------------------------------------------------------------------

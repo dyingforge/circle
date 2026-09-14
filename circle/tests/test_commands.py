@@ -48,21 +48,40 @@ class InitializationTest(CircleTestCase):
         self.preview_commit()
         self.assertIn("already exists", self.rejected("preview", data=import_payload()))
 
-    def test_preview_reports_inferences_warnings_and_fills_missing_documents(self):
+    def test_preview_requires_every_document(self):
+        names = {"agent": "AGENT.md", "architecture": "ARCHITECTURE.md", "domain": "DOMAIN.md"}
+        for field, filename in names.items():
+            with self.subTest(field=field):
+                payload = import_payload()
+                del payload["docs"][field]
+                stderr = self.rejected("preview", data=payload)
+                self.assertIn("missing project documents", stderr)
+                self.assertIn(filename, stderr)
+                self.assertIn("ask the user", stderr)
+                self.assertFalse(self.store.exists())
+
+    def test_a_blank_document_counts_as_missing(self):
+        payload = import_payload()
+        payload["docs"]["domain"] = "   \n"
+        self.assertIn("DOMAIN.md", self.rejected("preview", data=payload))
+        self.assertFalse(self.store.exists())
+
+    def test_preview_reports_inferences_warnings_and_accepts_placeholders(self):
         payload = import_payload()
         del payload["docs"]
         payload["inferences"] = ["项目名称来自一级标题"]
         payload["warnings"] = ["未提供负责人"]
-        preview = self.circle("preview", data=payload).stdout
+        preview = self.circle("preview", "--allow-placeholder-docs", data=payload).stdout
         self.assertIn("项目名称来自一级标题", preview)
         self.assertIn("未提供负责人", preview)
-        self.assertIn("docs.agent 未提供", preview)
-        self.assertIn("docs.architecture 未提供", preview)
-        self.assertIn("docs.domain 未提供", preview)
+        for field in ("agent", "architecture", "domain"):
+            self.assertIn(f"docs.{field} 未提供", preview)
 
         digest = re.search(r"Snapshot: `([0-9a-f]{64})`", preview).group(1)
         self.circle("commit", "--snapshot", digest)
-        self.assertIn("TODO", (self.store / "DOMAIN.md").read_text(encoding="utf-8"))
+        domain = (self.store / "DOMAIN.md").read_text(encoding="utf-8")
+        self.assertIn("TODO", domain)
+        self.assertIn("circle:placeholder", domain)
 
     def test_commit_rejects_a_tampered_snapshot(self):
         preview = self.circle("preview", data=import_payload()).stdout
@@ -288,6 +307,176 @@ class LifecycleTest(CircleTestCase):
         self.circle("validate")
         text = (self.store / "issues" / f"{ids['model']}.md").read_text(encoding="utf-8")
         self.assertIn("- [x] 已达成", text)
+
+
+class AcceptanceTest(CircleTestCase):
+    def three_items(self):
+        """Commit a store whose single issue carries three acceptance criteria."""
+        payload = import_payload()
+        item = make_issue("model", "Model")
+        item["acceptance"] = ["第一项", "第二项", "第三项"]
+        payload["issues"] = [item]
+        return self.preview_commit(payload)["model"]
+
+    def acceptance(self, issue_id):
+        shown = json.loads(self.circle("issue-show", "--id", issue_id).stdout)
+        return [(item["text"], item["done"]) for item in shown["acceptance"]]
+
+    def test_checking_one_item_leaves_the_others_alone(self):
+        issue_id = self.three_items()
+        revision = self.check_acceptance(issue_id, 1, 2)
+        self.assertEqual(2, revision)
+        self.assertEqual(
+            [("第一项", False), ("第二项", True), ("第三项", False)], self.acceptance(issue_id)
+        )
+        text = (self.store / "issues" / f"{issue_id}.md").read_text(encoding="utf-8")
+        self.assertEqual(["- [ ] 第一项", "- [x] 第二项", "- [ ] 第三项"],
+                         [line for line in text.splitlines() if line.startswith("- [")])
+
+    def test_several_items_can_be_checked_in_one_call(self):
+        issue_id = self.three_items()
+        self.check_acceptance(issue_id, 1, 1, 3)
+        self.assertEqual(
+            [("第一项", True), ("第二项", False), ("第三项", True)], self.acceptance(issue_id)
+        )
+
+    def test_uncheck_restores_a_single_item(self):
+        issue_id = self.three_items()
+        revision = self.check_acceptance(issue_id, 1, 1, 2, 3)
+        unchecked = json.loads(self.circle(
+            "acceptance-uncheck", "--id", issue_id, "--item", "2",
+            "--expected-revision", str(revision)).stdout)
+        self.assertEqual(3, unchecked["revision"])
+        self.assertEqual(
+            [("第一项", True), ("第二项", False), ("第三项", True)], self.acceptance(issue_id)
+        )
+
+    def test_rejects_bad_item_numbers(self):
+        issue_id = self.three_items()
+        for item in ("0", "-1", "4"):
+            with self.subTest(item=item):
+                stderr = self.rejected(
+                    "acceptance-check", "--id", issue_id, "--item", item,
+                    "--expected-revision", "1")
+                self.assertIn("out of range", stderr)
+        self.assertEqual(
+            [("第一项", False), ("第二项", False), ("第三项", False)], self.acceptance(issue_id)
+        )
+
+    def test_rejects_a_state_that_is_already_settled(self):
+        issue_id = self.three_items()
+        revision = self.check_acceptance(issue_id, 1, 2)
+        self.assertIn("already checked", self.rejected(
+            "acceptance-check", "--id", issue_id, "--item", "2",
+            "--expected-revision", str(revision)))
+        self.assertIn("already unchecked", self.rejected(
+            "acceptance-uncheck", "--id", issue_id, "--item", "1",
+            "--expected-revision", str(revision)))
+        self.assertEqual(2, json.loads(self.circle("issue-show", "--id", issue_id).stdout)["revision"])
+
+    def test_requires_a_current_revision(self):
+        issue_id = self.three_items()
+        self.check_acceptance(issue_id, 1, 1)
+        self.assertIn("stale revision", self.rejected(
+            "acceptance-check", "--id", issue_id, "--item", "2", "--expected-revision", "1"))
+
+    def test_done_requires_every_item_checked(self):
+        issue_id = self.three_items()
+        for state in ("ready", "in_progress", "review"):
+            self.transition(issue_id, state, 1 + ("ready", "in_progress", "review").index(state))
+        revision = 4
+        self.check_acceptance(issue_id, revision, 2)
+        revision += 1
+        stderr = self.transition(issue_id, "done", revision, expect=2)
+        self.assertIn("unchecked acceptance criteria", stderr)
+        self.assertIn("第一项", stderr)
+        self.assertIn("第三项", stderr)
+        self.assertEqual("review", json.loads(
+            self.circle("issue-show", "--id", issue_id).stdout)["state"])
+
+        revision = self.check_acceptance(issue_id, revision, 1, 3)
+        self.transition(issue_id, "done", revision)
+        self.assertEqual("done", json.loads(
+            self.circle("issue-show", "--id", issue_id).stdout)["state"])
+
+    def test_a_done_issue_cannot_be_reticked(self):
+        issue_id = self.three_items()
+        self.complete(issue_id, 1)
+        shown = json.loads(self.circle("issue-show", "--id", issue_id).stdout)
+        self.assertIn("immutable", self.rejected(
+            "acceptance-check", "--id", issue_id, "--item", "1",
+            "--expected-revision", str(shown["revision"])))
+        self.assertIn("immutable", self.rejected(
+            "acceptance-uncheck", "--id", issue_id, "--item", "1",
+            "--expected-revision", str(shown["revision"])))
+
+    def test_issue_edit_still_replaces_the_whole_list(self):
+        issue_id = self.three_items()
+        edited = json.loads(self.circle(
+            "issue-edit", "--id", issue_id, "--expected-revision", "1",
+            data={"acceptance": ["只剩一项"]}).stdout)
+        self.assertEqual([{"text": "只剩一项", "done": False}], edited["acceptance"])
+        self.assertIn("out of range", self.rejected(
+            "acceptance-check", "--id", issue_id, "--item", "2", "--expected-revision", "2"))
+
+
+class DocumentsTest(CircleTestCase):
+    def placeholder_store(self):
+        """A store whose three documents were never supplied."""
+        payload = {"project": {"name": "Demo"}, "issues": [make_issue("model", "Model")]}
+        return self.preview_commit(payload, allow_placeholders=True)
+
+    def test_status_and_validate_report_placeholders(self):
+        self.placeholder_store()
+        status = self.circle("status").stdout
+        for doc in ("AGENT.md", "ARCHITECTURE.md", "DOMAIN.md"):
+            self.assertIn(f"{doc} placeholder", status)
+        self.assertIn("Warning: placeholder documents", self.circle("validate").stdout)
+
+    def test_a_complete_project_reports_no_placeholders(self):
+        self.preview_commit()
+        self.assertIn("AGENT.md ok", self.circle("status").stdout)
+        self.assertIn("Documents: AGENT.md ok, ARCHITECTURE.md ok, DOMAIN.md ok",
+                      self.circle("status").stdout)
+        self.assertNotIn("Warning", self.circle("validate").stdout)
+
+    def test_legacy_placeholder_text_is_still_detected(self):
+        self.placeholder_store()
+        (self.store / "DOMAIN.md").write_text(
+            "# Demo: Domain\n\nTODO: 补充Domain相关内容。\n", encoding="utf-8")
+        self.assertIn("DOMAIN.md placeholder", self.circle("status").stdout)
+
+    def test_docs_set_fills_each_document(self):
+        self.placeholder_store()
+        for doc, body in (("agent", "## 约定\n\n先读 DOMAIN.md。"),
+                          ("architecture", "# 真实架构\n\n控制器 + 事实库。"),
+                          ("domain", "# 真实领域\n\nGoal / Blocker。")):
+            with self.subTest(doc=doc):
+                result = self.circle("docs-set", "--doc", doc, stdin=body)
+                self.assertIn("Updated", result.stdout)
+        self.assertIn("Documents: AGENT.md ok, ARCHITECTURE.md ok, DOMAIN.md ok",
+                      self.circle("status").stdout)
+        self.assertIn("先读 DOMAIN.md。", (self.store / "AGENT.md").read_text(encoding="utf-8"))
+        self.assertIn("真实架构", (self.store / "ARCHITECTURE.md").read_text(encoding="utf-8"))
+        self.circle("validate")
+
+    def test_docs_set_keeps_the_agent_front_matter(self):
+        self.placeholder_store()
+        before = (self.store / "AGENT.md").read_text(encoding="utf-8").splitlines()
+        created = [line for line in before if line.startswith("created_at:")][0]
+        self.circle("docs-set", "--doc", "agent", stdin="## 约定\n\n只用标准库。")
+        after = (self.store / "AGENT.md").read_text(encoding="utf-8")
+        self.assertIn('name: "Demo"', after)
+        self.assertIn(created, after)
+        self.assertIn("只用标准库。", after)
+        self.assertNotIn("circle:placeholder", after)
+
+    def test_docs_set_rejects_an_empty_body_and_an_unknown_document(self):
+        self.placeholder_store()
+        self.assertIn("must not be empty", self.rejected("docs-set", "--doc", "domain", stdin="  \n"))
+        result = support.run_circle(self.root, "docs-set", "--doc", "nope")
+        self.assertEqual(2, result.returncode)
+        self.assertIn("invalid choice", result.stderr)
 
 
 class AddIssuesAfterImportTest(CircleTestCase):

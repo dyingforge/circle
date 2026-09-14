@@ -22,11 +22,14 @@ if str(SCRIPTS) not in sys.path:
 ENTRY = SCRIPTS / "circle.py"
 
 
-def run_circle(root, command, *args, data=None):
-    """Run the CLI against an explicit project root."""
+def run_circle(root, command, *args, data=None, stdin=None):
+    """Run the CLI against an explicit project root.
+
+    `data` is serialised as JSON on standard input; `stdin` sends raw text.
+    """
     return subprocess.run(
         [sys.executable, str(ENTRY), "--project-root", str(root), command, *args],
-        input=None if data is None else json.dumps(data),
+        input=stdin if stdin is not None else (None if data is None else json.dumps(data)),
         text=True,
         capture_output=True,
     )
@@ -78,8 +81,8 @@ class CircleTestCase(unittest.TestCase):
     def store(self):
         return self.root / ".circle"
 
-    def circle(self, command, *args, data=None, expect=0):
-        result = run_circle(self.root, command, *args, data=data)
+    def circle(self, command, *args, data=None, stdin=None, expect=0):
+        result = run_circle(self.root, command, *args, data=data, stdin=stdin)
         if result.returncode != expect:
             self.fail(
                 f"circle {command} exited {result.returncode}, expected {expect}\n"
@@ -87,9 +90,9 @@ class CircleTestCase(unittest.TestCase):
             )
         return result
 
-    def rejected(self, command, *args, data=None):
+    def rejected(self, command, *args, data=None, stdin=None):
         """Run a command expected to fail, returning its stderr."""
-        return self.circle(command, *args, data=data, expect=2).stderr
+        return self.circle(command, *args, data=data, stdin=stdin, expect=2).stderr
 
     def git(self, *args, expect=0):
         result = subprocess.run(["git", *args], cwd=self.root, text=True, capture_output=True)
@@ -104,8 +107,9 @@ class CircleTestCase(unittest.TestCase):
         self.git("add", "-A")
         self.git("commit", "-qm", "circle facts")
 
-    def preview_commit(self, payload=None):
-        preview = self.circle("preview", data=payload or import_payload()).stdout
+    def preview_commit(self, payload=None, allow_placeholders=False):
+        flags = ["--allow-placeholder-docs"] if allow_placeholders else []
+        preview = self.circle("preview", *flags, data=payload or import_payload()).stdout
         digest = re.search(r"Snapshot: `([0-9a-f]{64})`", preview).group(1)
         found = re.findall(r"\| (CIR-[A-Z0-9]{10}) \| (\w+) \|", preview)
         self.circle("commit", "--snapshot", digest)
@@ -119,8 +123,22 @@ class CircleTestCase(unittest.TestCase):
             return self.rejected("issue-transition", *args)
         return self.circle("issue-transition", *args)
 
+    def check_acceptance(self, issue_id, revision, *items):
+        """Tick the given 1-based acceptance items, returning the new revision."""
+        args = ["--id", issue_id, "--expected-revision", str(revision)]
+        for index in items:
+            args += ["--item", str(index)]
+        return json.loads(self.circle("acceptance-check", *args).stdout)["revision"]
+
+    def check_all_acceptance(self, issue_id, revision):
+        shown = json.loads(self.circle("issue-show", "--id", issue_id).stdout)
+        pending = [index for index, item in enumerate(shown["acceptance"], 1) if not item["done"]]
+        return revision if not pending else self.check_acceptance(issue_id, revision, *pending)
+
     def complete(self, issue_id, revision, states=("ready", "in_progress", "review", "done")):
         for state in states:
+            if state == "done":
+                revision = self.check_all_acceptance(issue_id, revision)
             self.transition(issue_id, state, revision)
             revision += 1
         return revision
