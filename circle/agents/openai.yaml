@@ -1,6 +1,6 @@
 interface:
   display_name: "Circle"
   short_description: "Manage local projects, issues, and dependency DAGs"
-  default_prompt: "Use $circle /init to import this project, or manage its existing Circle issues."
+  default_prompt: "Use $circle /init to import this project, then manage its issues and execute them on per-issue branches."
 policy:
   allow_implicit_invocation: true
