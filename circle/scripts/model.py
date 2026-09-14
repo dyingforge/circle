@@ -17,12 +17,11 @@ import secrets
 import string
 from typing import Any, Iterator
 
-from document import parse_document, parse_sections, write_document
+from document import atomic_write, parse_document, parse_sections, write_document, write_text
 from errors import CircleError
 from graph import (
     DONE,
     READY,
-    actionable_ids,
     assert_acyclic,
     is_unblocked,
     unfinished_blockers,
@@ -40,9 +39,11 @@ DOC_FILENAMES = dict(DOCUMENTS)
 SUPPORTING_DOCS = (ARCHITECTURE_DOC, DOMAIN_DOC)
 
 DRAFT = "draft"
+IN_PROGRESS = "in_progress"
+REVIEW = "review"
 CANCELLED = "cancelled"
-STATES = (DRAFT, READY, "in_progress", "review", DONE, CANCELLED)
-FORWARD = {DRAFT: READY, READY: "in_progress", "in_progress": "review", "review": DONE}
+STATES = (DRAFT, READY, IN_PROGRESS, REVIEW, DONE, CANCELLED)
+FORWARD = {DRAFT: READY, READY: IN_PROGRESS, IN_PROGRESS: REVIEW, REVIEW: DONE}
 UNSTARTABLE_STATES = (DONE, CANCELLED)
 
 ID_PREFIX = "CIR-"
@@ -218,13 +219,18 @@ def issue_fields(issue: dict[str, Any]) -> list[tuple[str, Any]]:
     return [(field, issue[field]) for field in FRONT_MATTER_FIELDS]
 
 
+def acceptance_line(item: dict[str, Any]) -> str:
+    """One acceptance criterion in the checkbox form the issue body stores."""
+    return f"- [{'x' if item['done'] else ' '}] {item['text']}"
+
+
 def issue_body(issue: dict[str, Any]) -> str:
     lines: list[str] = []
     for heading, field in PROSE_SECTIONS:
         lines += [f"## {heading}", "", issue[field].strip(), ""]
     lines += [f"## {ACCEPTANCE_SECTION}", ""]
     for item in issue["acceptance"]:
-        lines.append(f"- [{'x' if item['done'] else ' '}] {item['text']}")
+        lines.append(acceptance_line(item))
     comments = issue["comments"].strip()
     if comments:
         lines += ["", f"## {COMMENTS_SECTION}", "", comments]
@@ -298,7 +304,7 @@ def load_issues(store: Path) -> dict[str, dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
-# Project documents and store loading
+# Project documents
 # --------------------------------------------------------------------------
 
 def load_project(store: Path) -> dict[str, Any]:
@@ -329,6 +335,45 @@ def placeholder_documents(store: Path) -> list[str]:
         if PLACEHOLDER_MARKER in text or any(item in text for item in LEGACY_PLACEHOLDER_TEXTS):
             result.append(doc)
     return result
+
+
+def write_project_document(
+    store: Path, doc: str, body: str, *, name: str, created_at: str
+) -> None:
+    """Replace one project document body. `doc` is `agent`, `architecture` or `domain`.
+
+    `AGENT.md` carries the project identity in its front matter, so its header is
+    written here rather than by the caller.
+    """
+    if doc == "agent":
+        write_document(store / AGENT_DOC, [("name", name), ("created_at", created_at)], body)
+    else:
+        write_text(store / DOC_FILENAMES[doc], body)
+
+
+# --------------------------------------------------------------------------
+# Store
+# --------------------------------------------------------------------------
+
+def create_store(
+    store: Path,
+    *,
+    name: str,
+    created_at: str,
+    docs: dict[str, str],
+    issues: list[dict[str, Any]],
+) -> None:
+    """Materialise a whole fact store under `store`, which must not exist yet."""
+    (store / ISSUES_DIR).mkdir(parents=True)
+    for field, _ in DOCUMENTS:
+        write_project_document(store, field, docs[field], name=name, created_at=created_at)
+    for issue in issues:
+        write_issue_to(store / ISSUES_DIR / f"{issue['id']}.md", issue)
+    write_dag(store, {issue["id"]: issue for issue in issues})
+
+
+def write_dag(store: Path, issues: dict[str, dict[str, Any]]) -> None:
+    atomic_write(store / DAG_DOC, render_dag(issues))
 
 
 def load_store(store: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
@@ -377,6 +422,35 @@ def validate_graph(issues: dict[str, dict[str, Any]]) -> None:
 
 
 # --------------------------------------------------------------------------
+# Lifecycle
+# --------------------------------------------------------------------------
+
+def read_state(data: dict[str, Any], label: str) -> str:
+    state = data.get("state", DRAFT)
+    if state not in {DRAFT, READY}:
+        raise CircleError(f"{label}.state must be {DRAFT} or {READY}")
+    return state
+
+
+def transition_error(current: str, target: str) -> str | None:
+    """Why `current -> target` is refused, or None when the transition is legal.
+
+    `done` is terminal and has no outgoing edge at all, so following FORWARD is
+    not enough: the cancellation branch below would otherwise carry
+    `done -> cancelled`.
+    """
+    if current == DONE:
+        return "done is terminal and cannot be reopened"
+    if target == FORWARD.get(current):
+        return None
+    if target == CANCELLED and current != CANCELLED:
+        return None
+    if current == CANCELLED and target == DRAFT:
+        return None
+    return f"invalid transition: {current} -> {target}"
+
+
+# --------------------------------------------------------------------------
 # Creation
 # --------------------------------------------------------------------------
 
@@ -385,13 +459,6 @@ def generate_id(existing: set[str]) -> str:
         candidate = ID_PREFIX + "".join(secrets.choice(ID_ALPHABET) for _ in range(ID_SUFFIX_LENGTH))
         if candidate not in existing:
             return candidate
-
-
-def read_state(data: dict[str, Any], label: str) -> str:
-    state = data.get("state", DRAFT)
-    if state not in {DRAFT, READY}:
-        raise CircleError(f"{label}.state must be {DRAFT} or {READY}")
-    return state
 
 
 def build_issue(

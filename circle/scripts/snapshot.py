@@ -22,6 +22,7 @@ from model import (
     DOCUMENTS,
     PLACEHOLDER_MARKER,
     PROSE_SECTIONS,
+    acceptance_line,
     normalize_body,
     normalize_issue_batch,
     normalize_string_list,
@@ -31,7 +32,6 @@ from model import (
 )
 
 
-SCHEMA_VERSION = 2
 IMPORT_KEYS = ("project", "docs", "issues", "inferences", "warnings", "raw_summary")
 
 
@@ -133,7 +133,6 @@ def normalize_import(
     inferences.extend(f"docs.{field} 未提供，已写入占位内容" for field, _ in missing)
 
     snapshot = {
-        "schema_version": SCHEMA_VERSION,
         "project_root": str(root.resolve()),
         "project": {"name": name, "description": description},
         "docs": resolved,
@@ -172,7 +171,7 @@ def render_preview(snapshot: dict[str, Any]) -> str:
         for heading, field in PROSE_SECTIONS:
             lines += ["", f"**{heading}**", "", issue[field]]
         lines += ["", f"**{ACCEPTANCE_SECTION}**", ""]
-        lines.extend(f"- [{'x' if item['done'] else ' '}] {item['text']}" for item in issue["acceptance"])
+        lines.extend(acceptance_line(item) for item in issue["acceptance"])
     for label in ("inferences", "warnings"):
         if snapshot[label]:
             lines.extend(["", f"## {label.title()}", ""] + [f"- {item}" for item in snapshot[label]])

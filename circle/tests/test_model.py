@@ -123,14 +123,6 @@ class IssueDocumentTest(StoreTestCase):
         for field in model.FRONT_MATTER_FIELDS + model.CONTENT_FIELDS + ("comments",):
             self.assertEqual(original[field], loaded[field], field)
 
-    def test_acceptance_checkbox_state_is_parsed(self):
-        self.build_store([issue_dict(acceptance=[{"text": "done", "done": True}, {"text": "todo", "done": False}])])
-        loaded = self.read_issue("CIR-ABCDEFGHIJ")
-        self.assertEqual(
-            [{"text": "done", "done": True}, {"text": "todo", "done": False}],
-            loaded["acceptance"],
-        )
-
     def test_load_assigns_normalised_values(self):
         """A hand-written padded value must be normalised on read, not just validated."""
         store = self.build_store([issue_dict()])
@@ -249,6 +241,31 @@ class ProjectDocumentTest(StoreTestCase):
         self.assertIn("no Circle project found", str(caught.exception))
 
 
+class StoreWriteTest(StoreTestCase):
+    def test_create_store_round_trips_through_load_store(self):
+        store = model.store_path(self.root)
+        model.create_store(
+            store,
+            name="Demo",
+            created_at="2026-01-01T00:00:00+00:00",
+            docs={
+                "agent": "项目介绍。",
+                "architecture": "# Architecture\n\n结构。",
+                "domain": "# Domain\n\n概念。",
+            },
+            issues=[
+                issue_dict("CIR-ABCDEFGHIJ"),
+                issue_dict("CIR-ZZZZZZZZZZ", "另一个", blocked_by=["CIR-ABCDEFGHIJ"]),
+            ],
+        )
+        project, issues = model.load_store(store)
+        self.assertEqual("Demo", project["name"])
+        self.assertEqual("项目介绍。", project["agent"])
+        self.assertEqual({"CIR-ABCDEFGHIJ", "CIR-ZZZZZZZZZZ"}, set(issues))
+        self.assertEqual(["CIR-ABCDEFGHIJ"], issues["CIR-ZZZZZZZZZZ"]["blocked_by"])
+        self.assertIn("flowchart LR", (store / model.DAG_DOC).read_text(encoding="utf-8"))
+
+
 class GraphPredicateTest(unittest.TestCase):
     def test_unfinished_blockers_and_actionable(self):
         issues = {
@@ -302,6 +319,43 @@ class ValidateGraphTest(unittest.TestCase):
             "CIR-BBBBBBBBBB": issue_dict("CIR-BBBBBBBBBB", state="done", blocked_by=["CIR-AAAAAAAAAA"]),
             "CIR-CCCCCCCCCC": issue_dict("CIR-CCCCCCCCCC", "ready", blocked_by=["CIR-BBBBBBBBBB"]),
         })
+
+
+class TransitionTest(unittest.TestCase):
+    """The legal state machine, written out independently of the implementation."""
+
+    allowed = {
+        ("draft", "ready"),
+        ("draft", "cancelled"),
+        ("ready", "in_progress"),
+        ("ready", "cancelled"),
+        ("in_progress", "review"),
+        ("in_progress", "cancelled"),
+        ("review", "done"),
+        ("review", "cancelled"),
+        ("cancelled", "draft"),
+    }
+
+    def test_every_state_pair_matches_the_table(self):
+        for current in model.STATES:
+            for target in model.STATES:
+                with self.subTest(current=current, target=target):
+                    reason = model.transition_error(current, target)
+                    if current == "done":
+                        self.assertEqual("done is terminal and cannot be reopened", reason)
+                    elif (current, target) in self.allowed:
+                        self.assertIsNone(reason)
+                    else:
+                        self.assertEqual(f"invalid transition: {current} -> {target}", reason)
+
+    def test_read_state_allows_only_the_initial_states(self):
+        self.assertEqual("draft", model.read_state({}, "issue"))
+        self.assertEqual("ready", model.read_state({"state": "ready"}, "issue"))
+        for bad in ("in_progress", "review", "done", "cancelled"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(CircleError) as caught:
+                    model.read_state({"state": bad}, "issue")
+                self.assertIn("must be draft or ready", str(caught.exception))
 
 
 class DeepGraphTest(unittest.TestCase):

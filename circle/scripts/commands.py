@@ -1,40 +1,39 @@
 """Command layer: one function per CLI subcommand.
 
-Read-only commands resolve the store once. Mutations take the store lock, which
-also yields the resolved store path, so nothing resolves it twice.
+Read-only commands resolve the store once. Mutations go through the store lock,
+which also yields the resolved store path, so nothing resolves it twice.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 from pathlib import Path
 import shutil
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Iterator
 
 import workbranch
-from document import atomic_write, read_text, write_document, write_text
+from document import read_text
 from errors import CircleError
 from graph import actionable_ids, is_unblocked, unfinished_blockers
 from model import (
     AGENT_DOC,
-    ARCHITECTURE_DOC,
-    CANCELLED,
-    DAG_DOC,
     DOCUMENTS,
     DOC_FILENAMES,
-    DOMAIN_DOC,
+    DONE,
     EDITABLE_FIELDS,
-    FORWARD,
     IMMUTABLE_WHEN_DONE,
+    IN_PROGRESS,
     ISSUES_DIR,
     STORE_DIR,
     STATES,
     SUPPORTING_DOCS,
     acceptance_indices,
     check_revision,
+    create_store,
     issue_path,
     issue_view,
     load_project,
@@ -48,16 +47,17 @@ from model import (
     now,
     optional_text,
     placeholder_documents,
-    render_dag,
     require_issue,
     require_store,
     root_lock,
     store_lock,
     store_path,
+    transition_error,
     validate_graph,
     validate_id,
+    write_dag,
     write_issue,
-    write_issue_to,
+    write_project_document,
 )
 from snapshot import (
     compose_agent_body,
@@ -115,26 +115,22 @@ def cmd_preview(args: argparse.Namespace) -> None:
 def cmd_commit(args: argparse.Namespace) -> None:
     snapshot, path = load_snapshot(args.snapshot, args.project_root)
     root = args.project_root
+    project = snapshot["project"]
     with root_lock(root):
         target = store_path(root)
         if target.exists():
             raise CircleError("Circle project already exists; commit refused")
         stage = Path(tempfile.mkdtemp(prefix=f".{STORE_DIR}-stage-", dir=root))
+        docs = dict(snapshot["docs"])
+        docs["agent"] = compose_agent_body(project["description"], docs["agent"])
         try:
-            (stage / ISSUES_DIR).mkdir()
-            project = snapshot["project"]
-            docs = snapshot["docs"]
-            write_document(
-                stage / AGENT_DOC,
-                [("name", project["name"]), ("created_at", snapshot["created_at"])],
-                compose_agent_body(project["description"], docs["agent"]),
+            create_store(
+                stage,
+                name=project["name"],
+                created_at=snapshot["created_at"],
+                docs=docs,
+                issues=snapshot["issues"],
             )
-            write_text(stage / ARCHITECTURE_DOC, docs["architecture"])
-            write_text(stage / DOMAIN_DOC, docs["domain"])
-            issues = {item["id"]: item for item in snapshot["issues"]}
-            for issue in issues.values():
-                write_issue_to(stage / ISSUES_DIR / f"{issue['id']}.md", issue)
-            atomic_write(stage / DAG_DOC, render_dag(issues))
             stage.rename(target)
         except BaseException:
             shutil.rmtree(stage, ignore_errors=True)
@@ -181,7 +177,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 def cmd_render(args: argparse.Namespace) -> None:
     _, issues = read_store(args.project_root)
-    atomic_write(store_path(args.project_root) / DAG_DOC, render_dag(issues))
+    write_dag(store_path(args.project_root), issues)
     print(f"Rendered DAG for {len(issues)} issues.")
 
 
@@ -214,17 +210,75 @@ def cmd_issue_context(args: argparse.Namespace) -> None:
 # Issue mutations
 # --------------------------------------------------------------------------
 
+class IssueMutation:
+    """One guarded edit of an existing issue, staged for the lock to write."""
+
+    def __init__(self, issues: dict[str, dict[str, Any]], issue: dict[str, Any]):
+        self.issues = issues
+        self.issue = issue
+        self.before = actionable_ids(issues)
+        self.updated = dict(issue)
+
+    def stage(self, updated: dict[str, Any]) -> None:
+        self.updated = updated
+
+
+@contextlib.contextmanager
+def issue_mutation(args: argparse.Namespace) -> Iterator[IssueMutation]:
+    """Serialise one edit of an existing issue.
+
+    The caller stages a replacement inside the block. On clean exit the revision
+    is bumped, the graph re-validated and the issue written; a raise anywhere in
+    the block drops the staged replacement, which is what makes every rejected
+    mutation atomic.
+    """
+    root = args.project_root
+    with store_lock(root) as store:
+        _, issues = load_store(store)
+        issue = require_issue(issues, args.id)
+        mutation = IssueMutation(issues, issue)
+        check_revision(issue, args.expected_revision)
+        yield mutation
+        updated = mutation.updated
+        updated["revision"] = issue["revision"] + 1
+        updated["updated_at"] = now()
+        issues[issue["id"]] = updated
+        validate_graph(issues)
+        write_issue(root, updated)
+
+
+class IssueCreation:
+    """New issues staged for the lock to validate and write as one batch."""
+
+    def __init__(self, issues: dict[str, dict[str, Any]]):
+        self.issues = issues
+        self.before = actionable_ids(issues)
+        self.created: list[dict[str, Any]] = []
+
+    def add(self, issue: dict[str, Any]) -> dict[str, Any]:
+        self.issues[issue["id"]] = issue
+        self.created.append(issue)
+        return issue
+
+
+@contextlib.contextmanager
+def issue_creation(args: argparse.Namespace) -> Iterator[IssueCreation]:
+    """Serialise one batch creation, writing every staged issue on clean exit."""
+    root = args.project_root
+    with store_lock(root) as store:
+        _, issues = load_store(store)
+        batch = IssueCreation(issues)
+        yield batch
+        validate_graph(issues)
+        for issue in batch.created:
+            write_issue(root, issue)
+
+
 def cmd_issue_add(args: argparse.Namespace) -> None:
     data = json_stdin()
-    root = args.project_root
-    with store_lock(root):
-        _, issues = load_store(require_store(root))
-        before = actionable_ids(issues)
-        issue = normalize_new_issue(data, issues)
-        issues[issue["id"]] = issue
-        validate_graph(issues)
-        write_issue(root, issue)
-    report(issue, issues, before)
+    with issue_creation(args) as batch:
+        issue = batch.add(normalize_new_issue(data, batch.issues))
+    report(issue, batch.issues, batch.before)
 
 
 def cmd_issue_import(args: argparse.Namespace) -> None:
@@ -234,19 +288,13 @@ def cmd_issue_import(args: argparse.Namespace) -> None:
         raise CircleError(f"unknown import fields: {', '.join(unknown)}")
     inferences = normalize_string_list(payload.get("inferences"), "inferences")
     warnings = normalize_string_list(payload.get("warnings"), "warnings")
-    root = args.project_root
-    with store_lock(root):
-        _, issues = load_store(require_store(root))
-        before = actionable_ids(issues)
-        created, _ = normalize_issue_batch(payload.get("issues"), issues)
+    with issue_creation(args) as batch:
+        created, _ = normalize_issue_batch(payload.get("issues"), batch.issues)
         for issue in created:
-            issues[issue["id"]] = issue
-        validate_graph(issues)
-        for issue in created:
-            write_issue(root, issue)
+            batch.add(issue)
     print(json.dumps({
-        "created": [issue_view(issue, issues) for issue in created],
-        "newly_actionable": sorted(actionable_ids(issues) - before),
+        "created": [issue_view(issue, batch.issues) for issue in created],
+        "newly_actionable": sorted(actionable_ids(batch.issues) - batch.before),
         "inferences": inferences,
         "warnings": warnings,
     }, ensure_ascii=False, indent=2))
@@ -259,21 +307,12 @@ def cmd_issue_edit(args: argparse.Namespace) -> None:
         raise CircleError(f"unknown editable fields: {', '.join(unknown)}")
     if not changes:
         raise CircleError("no changes supplied")
-    root = args.project_root
-    with store_lock(root):
-        _, issues = load_store(require_store(root))
-        issue = require_issue(issues, args.id)
-        before = actionable_ids(issues)
-        check_revision(issue, args.expected_revision)
-        if issue["state"] == "done" and set(changes) & set(IMMUTABLE_WHEN_DONE):
+    with issue_mutation(args) as mutation:
+        issue = mutation.issue
+        if issue["state"] == DONE and set(changes) & set(IMMUTABLE_WHEN_DONE):
             raise CircleError("done issue title, execution content, and dependencies are immutable")
-        updated = apply_edit(issue, changes)
-        updated["revision"] += 1
-        updated["updated_at"] = now()
-        issues[args.id] = updated
-        validate_graph(issues)
-        write_issue(root, updated)
-    report(updated, issues, before)
+        mutation.stage(apply_edit(issue, changes))
+    report(mutation.updated, mutation.issues, mutation.before)
 
 
 def apply_edit(issue: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
@@ -293,28 +332,17 @@ def apply_edit(issue: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]
 def cmd_issue_transition(args: argparse.Namespace) -> None:
     if args.state not in STATES:
         raise CircleError(f"invalid target state: {args.state}")
-    root = args.project_root
-    with store_lock(root):
-        _, issues = load_store(require_store(root))
-        issue = require_issue(issues, args.id)
-        before = actionable_ids(issues)
-        check_revision(issue, args.expected_revision)
-        current = issue["state"]
+    with issue_mutation(args) as mutation:
+        issue = mutation.issue
         target = args.state
-        if current == "done":
-            raise CircleError("done is terminal and cannot be reopened")
-        allowed = (
-            target == FORWARD.get(current)
-            or (target == CANCELLED and current != CANCELLED)
-            or (current == CANCELLED and target == "draft")
-        )
-        if not allowed:
-            raise CircleError(f"invalid transition: {current} -> {target}")
-        if target in {"in_progress", "done"}:
-            unfinished = unfinished_blockers(issue, issues)
+        reason = transition_error(issue["state"], target)
+        if reason:
+            raise CircleError(reason)
+        if target in (IN_PROGRESS, DONE):
+            unfinished = unfinished_blockers(issue, mutation.issues)
             if unfinished:
                 raise CircleError(f"unfinished blockers prevent {target}: {', '.join(unfinished)}")
-        if target == "done":
+        if target == DONE:
             unchecked = [
                 f"{index}. {item['text']}"
                 for index, item in enumerate(issue["acceptance"], 1)
@@ -324,16 +352,11 @@ def cmd_issue_transition(args: argparse.Namespace) -> None:
                 raise CircleError(
                     "unchecked acceptance criteria prevent done: " + "; ".join(unchecked)
                 )
-        updated = dict(issue)
-        updated["state"] = target
+        updated = dict(issue, state=target)
         if args.note:
             updated["comments"] = append_note(updated["comments"], args.note)
-        updated["revision"] += 1
-        updated["updated_at"] = now()
-        issues[args.id] = updated
-        validate_graph(issues)
-        write_issue(root, updated)
-    report(updated, issues, before)
+        mutation.stage(updated)
+    report(mutation.updated, mutation.issues, mutation.before)
 
 
 def append_note(comments: str, note: str) -> str:
@@ -343,15 +366,11 @@ def append_note(comments: str, note: str) -> str:
 
 def mutate_dependency(args: argparse.Namespace, add: bool) -> None:
     validate_id(args.blocker)
-    root = args.project_root
-    with store_lock(root):
-        _, issues = load_store(require_store(root))
-        issue = require_issue(issues, args.id)
-        before = actionable_ids(issues)
-        check_revision(issue, args.expected_revision)
-        if issue["state"] == "done":
+    with issue_mutation(args) as mutation:
+        issue = mutation.issue
+        if issue["state"] == DONE:
             raise CircleError("dependencies of a done issue are immutable")
-        if args.blocker not in issues:
+        if args.blocker not in mutation.issues:
             raise CircleError(f"unknown blocker: {args.blocker}")
         blocked_by = list(issue["blocked_by"])
         if add:
@@ -362,14 +381,8 @@ def mutate_dependency(args: argparse.Namespace, add: bool) -> None:
             if args.blocker not in blocked_by:
                 raise CircleError(f"dependency does not exist: {args.blocker}")
             blocked_by.remove(args.blocker)
-        updated = dict(issue)
-        updated["blocked_by"] = blocked_by
-        updated["revision"] += 1
-        updated["updated_at"] = now()
-        issues[args.id] = updated
-        validate_graph(issues)
-        write_issue(root, updated)
-    report(updated, issues, before)
+        mutation.stage(dict(issue, blocked_by=blocked_by))
+    report(mutation.updated, mutation.issues, mutation.before)
 
 
 def cmd_dependency_add(args: argparse.Namespace) -> None:
@@ -386,13 +399,9 @@ def cmd_dependency_remove(args: argparse.Namespace) -> None:
 
 def mutate_acceptance(args: argparse.Namespace, done: bool) -> None:
     """Tick or untick individual acceptance items, addressed by 1-based number."""
-    root = args.project_root
-    with store_lock(root):
-        _, issues = load_store(require_store(root))
-        issue = require_issue(issues, args.id)
-        before = actionable_ids(issues)
-        check_revision(issue, args.expected_revision)
-        if issue["state"] == "done":
+    with issue_mutation(args) as mutation:
+        issue = mutation.issue
+        if issue["state"] == DONE:
             raise CircleError("acceptance criteria of a done issue are immutable")
         selected = acceptance_indices(issue, args.item)
         settled = sorted(
@@ -404,17 +413,11 @@ def mutate_acceptance(args: argparse.Namespace, done: bool) -> None:
                 f"acceptance item already {state}: "
                 + ", ".join(str(index) for index in settled)
             )
-        updated = dict(issue)
-        updated["acceptance"] = [
+        mutation.stage(dict(issue, acceptance=[
             dict(item, done=done) if index in selected else item
             for index, item in enumerate(issue["acceptance"], 1)
-        ]
-        updated["revision"] += 1
-        updated["updated_at"] = now()
-        issues[args.id] = updated
-        validate_graph(issues)
-        write_issue(root, updated)
-    report(updated, issues, before)
+        ]))
+    report(mutation.updated, mutation.issues, mutation.before)
 
 
 def cmd_acceptance_check(args: argparse.Namespace) -> None:
@@ -435,17 +438,11 @@ def cmd_docs_set(args: argparse.Namespace) -> None:
     if not body:
         raise CircleError("document body must not be empty")
     root = args.project_root
-    with store_lock(root):
-        store = require_store(root)
+    with store_lock(root) as store:
         project = load_project(store)
-        if args.doc == "agent":
-            write_document(
-                store / AGENT_DOC,
-                [("name", project["name"]), ("created_at", project["created_at"])],
-                body,
-            )
-        else:
-            write_text(store / DOC_FILENAMES[args.doc], body)
+        write_project_document(
+            store, args.doc, body, name=project["name"], created_at=project["created_at"]
+        )
         remaining = placeholder_documents(store)
     print(f"Updated {DOC_FILENAMES[args.doc]}.")
     print("Placeholder documents remaining: " + (", ".join(remaining) or "none"))

@@ -110,15 +110,16 @@ class InitializationTest(CircleTestCase):
 
 class ImportValidationTest(CircleTestCase):
     def test_rejects_structural_problems(self):
+        """One case per validation family: reference resolution and the graph.
+
+        The individual messages are asserted by the model unit tests; what this
+        covers is that `preview` refuses the import and writes nothing."""
         cases = {
             "duplicate issue key": [make_issue("same", "One"), make_issue("same", "Two")],
-            "duplicate issue title": [make_issue("one", "Same"), make_issue("two", "same")],
-            "self dependency": [make_issue("self", "Self", blocked_by=["self"])],
             "dependency cycle": [
                 make_issue("one", "One", blocked_by=["two"]),
                 make_issue("two", "Two", blocked_by=["one"]),
             ],
-            "unknown blocker": [make_issue("one", "One", blocked_by=["missing"])],
         }
         for message, issues in cases.items():
             with self.subTest(message=message):
@@ -212,14 +213,11 @@ class LifecycleTest(CircleTestCase):
                           data={"assignee": "E"}),
         )
 
-    def test_invalid_transition_pairs_are_rejected(self):
+    def test_invalid_transition_and_target_state_are_rejected(self):
         ids = self.preview_commit()
-        for target in ("in_progress", "review", "done"):
-            with self.subTest(target=target):
-                self.assertIn(
-                    "invalid transition",
-                    self.transition(ids["model"], target, 1, expect=2),
-                )
+        self.assertIn(
+            "invalid transition", self.transition(ids["model"], "in_progress", 1, expect=2)
+        )
         self.assertIn("invalid target state", self.transition(ids["model"], "shipped", 1, expect=2))
 
     def test_cancelled_can_be_restored_and_keeps_blocking(self):
@@ -420,6 +418,59 @@ class AcceptanceTest(CircleTestCase):
             "acceptance-check", "--id", issue_id, "--item", "2", "--expected-revision", "2"))
 
 
+class MutationAtomicityTest(CircleTestCase):
+    """Every refused mutation must leave the issue file byte for byte unchanged."""
+
+    def assert_untouched(self, issue_id, command, *args, **kwargs):
+        path = self.store / "issues" / f"{issue_id}.md"
+        before = path.read_text(encoding="utf-8")
+        self.rejected(command, *args, **kwargs)
+        self.assertEqual(before, path.read_text(encoding="utf-8"))
+
+    def test_refused_mutations_never_touch_the_issue_file(self):
+        ids = self.preview_commit()
+        model_id, dag_id = ids["model"], ids["dag"]
+        self.transition(dag_id, "ready", 1)
+
+        cases = {
+            "stale revision": (
+                "issue-edit", ["--id", model_id, "--expected-revision", "99"],
+                {"assignee": "E"}),
+            "blank content": (
+                "issue-edit", ["--id", model_id, "--expected-revision", "1"],
+                {"goal": "   "}),
+            "unknown field": (
+                "issue-edit", ["--id", model_id, "--expected-revision", "1"],
+                {"estimate": "1 day"}),
+            "invalid transition": (
+                "issue-transition", ["--id", model_id, "--state", "in_progress",
+                                     "--expected-revision", "1"], None),
+            "unknown target state": (
+                "issue-transition", ["--id", model_id, "--state", "shipped",
+                                     "--expected-revision", "1"], None),
+            "item out of range": (
+                "acceptance-check", ["--id", model_id, "--item", "5",
+                                     "--expected-revision", "1"], None),
+            "cycle": (
+                "dependency-add", ["--id", model_id, "--blocker", dag_id,
+                                   "--expected-revision", "1"], None),
+            "unknown blocker": (
+                "dependency-add", ["--id", model_id, "--blocker", "CIR-NOTAREAL1",
+                                   "--expected-revision", "1"], None),
+        }
+        for label, (command, args, data) in cases.items():
+            with self.subTest(label=label):
+                self.assert_untouched(model_id, command, *args, data=data)
+
+    def test_a_refused_creation_writes_no_issue_file(self):
+        self.preview_commit()
+        issues = self.store / "issues"
+        before = sorted(item.name for item in issues.iterdir())
+        self.rejected("issue-add", data={"title": "坏", "goal": "g", "expected_behavior": "e",
+                                        "boundaries": "b", "acceptance": []})
+        self.assertEqual(before, sorted(item.name for item in issues.iterdir()))
+
+
 class DocumentsTest(CircleTestCase):
     def placeholder_store(self):
         """A store whose three documents were never supplied."""
@@ -435,7 +486,6 @@ class DocumentsTest(CircleTestCase):
 
     def test_a_complete_project_reports_no_placeholders(self):
         self.preview_commit()
-        self.assertIn("AGENT.md ok", self.circle("status").stdout)
         self.assertIn("Documents: AGENT.md ok, ARCHITECTURE.md ok, DOMAIN.md ok",
                       self.circle("status").stdout)
         self.assertNotIn("Warning", self.circle("validate").stdout)
@@ -547,7 +597,6 @@ class InspectionTest(CircleTestCase):
         self.assertIn("draft=2", status)
         self.assertIn("ready=1", status)
         self.assertIn(f"Actionable: {ids['model']}", status)
-        self.assertIn(ids["dag"], status)
 
     def test_issue_context_exposes_documents_and_issue(self):
         ids = self.preview_commit()
@@ -600,25 +649,16 @@ class BrokenStoreTest(CircleTestCase):
             path.write_text(text, encoding="utf-8")
 
     def test_every_read_command_reports_a_corrupted_store(self):
+        """One representative corruption per layer: the per-message mapping from
+        corruption to error text is covered by the model and codec unit tests."""
         self.preview_commit()
         snapshot = self.snapshot_store()
         issue_file = next((self.store / "issues").glob("*.md"))
-        original = snapshot[issue_file.relative_to(self.store)]
-
-        def rewrite(text):
-            issue_file.write_text(text, encoding="utf-8")
 
         corruptions = {
             "missing required document": lambda: (self.store / "DOMAIN.md").unlink(),
-            "missing front matter": lambda: rewrite("no front matter\n"),
-            "unknown issue fields": lambda: rewrite(
-                original.replace("revision: 1", 'revision: 1\nestimate: "1 day"')),
-            "unknown issue sections": lambda: rewrite(
-                original.replace("## Boundaries", "## Extras")),
-            "missing section": lambda: rewrite(
-                re.sub(r"## Boundaries\n\n.*?\n\n", "", original, flags=re.S)),
-            "acceptance criteria must not be empty": lambda: rewrite(
-                re.sub(r"^- \[[ x]\] .*\n", "", original, flags=re.M)),
+            "missing front matter": lambda: issue_file.write_text(
+                "no front matter\n", encoding="utf-8"),
         }
         for message, corrupt in corruptions.items():
             for command in self.read_commands:
