@@ -1,0 +1,21 @@
+{
+  "storageUpdatedAt": "2026-09-23T08:34:39.893495Z",
+  "retrievedAt": "2026-09-23T15:18:38.204059+00:00",
+  "sceneVersion": {
+    "integerValue": "687061"
+  },
+  "elementCount": 626,
+  "activeCount": 626,
+  "source": "Excalidraw official room persistence; room key omitted",
+  "extractedElementCount": 94,
+  "extractionBounds": {
+    "left": 950,
+    "right": 4700,
+    "top": -5350,
+    "bottom": -3750
+  },
+  "extractedSha256": "c30ed1398f504f9a14e3701c5c13c28aac052bd74a4aa0c83cf5b5b927171dc7",
+  "scope": "Only Circle workflow region extracted; other diagrams omitted",
+  "preview": "Geometry preview from source elements; not a pixel-identical browser export",
+  "freshness": "Latest persisted scene at retrieval time; unsaved live edits not verified"
+}

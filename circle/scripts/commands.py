@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 from typing import Any, Iterator
 
 import workbranch
@@ -37,6 +38,7 @@ from model import (
     issue_path,
     issue_view,
     load_project,
+    load_requirements,
     load_store,
     normalize_acceptance,
     normalize_blockers,
@@ -47,7 +49,9 @@ from model import (
     now,
     optional_text,
     placeholder_documents,
+    publication_metadata,
     require_issue,
+    require_authoring_mutable,
     require_store,
     root_lock,
     store_lock,
@@ -130,8 +134,16 @@ def cmd_commit(args: argparse.Namespace) -> None:
                 created_at=snapshot["created_at"],
                 docs=docs,
                 issues=snapshot["issues"],
+                requirements=[snapshot["requirement"]],
             )
-            stage.rename(target)
+            for attempt in range(5):
+                try:
+                    stage.rename(target)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
         except BaseException:
             shutil.rmtree(stage, ignore_errors=True)
             raise
@@ -173,6 +185,13 @@ def cmd_status(args: argparse.Namespace) -> None:
     ))
     print("Actionable: " + (", ".join(sorted(actionable)) or "none"))
     print("Blocked: " + (", ".join(sorted(blocked)) or "none"))
+    publication = publication_metadata(store_path(args.project_root))
+    if publication:
+        print(f"Execution mode: service (base={publication.get('base_commit') or 'unrecorded'})")
+        for issue_id, item in sorted(publication.get("issues", {}).items()):
+            print(f"Published {issue_id}: authoring_revision={item['authoring_revision']} "
+                  f"source_hash={item['source_hash']} service_state={item['service_state']} "
+                  f"service_version={item['service_version']}")
 
 
 def cmd_render(args: argparse.Namespace) -> None:
@@ -234,6 +253,7 @@ def issue_mutation(args: argparse.Namespace) -> Iterator[IssueMutation]:
     """
     root = args.project_root
     with store_lock(root) as store:
+        require_authoring_mutable(store, args.id)
         _, issues = load_store(store)
         issue = require_issue(issues, args.id)
         mutation = IssueMutation(issues, issue)
@@ -267,8 +287,18 @@ def issue_creation(args: argparse.Namespace) -> Iterator[IssueCreation]:
     root = args.project_root
     with store_lock(root) as store:
         _, issues = load_store(store)
+        requirements = load_requirements(store)
+        requirement_ids = set(requirements)
         batch = IssueCreation(issues)
         yield batch
+        for issue in batch.created:
+            if not issue["requirement_ids"] and len(requirement_ids) == 1:
+                issue["requirement_ids"] = list(requirement_ids)
+            if not issue["requirement_ids"]:
+                raise CircleError("new issues must link at least one requirement_id")
+            unknown = sorted(set(issue["requirement_ids"]) - requirement_ids)
+            if unknown:
+                raise CircleError("unknown requirement: " + ", ".join(unknown))
         validate_graph(issues)
         for issue in batch.created:
             write_issue(root, issue)
@@ -439,6 +469,7 @@ def cmd_docs_set(args: argparse.Namespace) -> None:
         raise CircleError("document body must not be empty")
     root = args.project_root
     with store_lock(root) as store:
+        require_authoring_mutable(store)
         project = load_project(store)
         write_project_document(
             store, args.doc, body, name=project["name"], created_at=project["created_at"]

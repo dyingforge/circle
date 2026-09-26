@@ -72,6 +72,9 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # JSON and Markdown pipes use UTF-8 on every supported platform.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8")
     args = parser().parse_args()
     args.project_root = args.project_root.resolve()
     if not args.project_root.is_dir():

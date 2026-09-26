@@ -1,5 +1,17 @@
 # Circle
 
+## Current implementation (2026-09-24)
+
+Circle now persists confirmed requirement provenance under `.circle/requirements`, links Issues
+through `requirement_ids`, and locks published execution facts against local mutation. The central
+Service provides manual claim/assignment, leases, structured criterion evidence, independent
+review, final acceptance, release/cancel/retry/recovery, cursor notifications, and `/workbench`.
+Each Issue uses an isolated Git worktree; claim responses carry publication base and dependency
+commits for `service_preflight.py`.
+
+The Service does not schedule or launch agents. External channel ingestion and production
+operations remain outside the current scope.
+
 Circle 是一个面向 Codex 的本地项目控制 Skill。它把项目拆成独立的 Markdown Issue，用有向无环图（DAG）描述依赖关系，并通过确定性的 Python 控制器维护状态、依赖和并发修订号。
 
 它适合希望把项目事实保留在 Git 仓库中、又不想依赖 GitHub Issues、Linear 等外部服务的团队。
@@ -98,7 +110,7 @@ Circle 由两部分组成：
 
 - Codex（用于加载并调用 Skill）
 - Python 3.9 或更高版本（已在 3.9.6 与 3.13 上验证）
-- macOS 或 Linux 等支持 `fcntl` 文件锁的系统
+- Windows、macOS 或 Linux（Windows 使用 `msvcrt`，其他系统使用 `fcntl`）
 - Git（仅执行 Issue 的分支工作流需要）
 - 无需安装第三方 Python 包
 
@@ -112,6 +124,14 @@ ln -s /path/to/this-repository/circle ~/.codex/skills/circle
 ```
 
 如果目标位置已经存在，请先确认其中内容，再选择更新或移除旧版本。安装后重新启动 Codex 或开始一个新会话，使 Skill 被重新发现。
+
+Windows PowerShell 可复制安装（目标不存在时）：
+
+```powershell
+Copy-Item -LiteralPath .\circle -Destination "$env:USERPROFILE\.codex\skills\circle" -Recurse
+```
+
+Windows 中将下文的 `python3` 替换为 `python`。控制器标准输入/输出统一使用 UTF-8；通过程序调用时应显式设置管道编码为 UTF-8。
 
 ## 快速开始
 
@@ -162,24 +182,22 @@ Commit 只接受同一项目根目录下、内容完整且哈希匹配的 Previe
 
 ## 执行 Issue
 
-每个 Issue 都在自己的临时分支上执行，完成后合并回创建它的分支并删除该分支。分支名与基线分支始终从 Issue 推导得出。
+每个 Issue 都在自己的独立 Git worktree 和临时分支中执行，完成后合并回创建它的基线分支，并删除 worktree 与分支。
 
 ```text
-$circle /issue start <id>     # 创建 circle/<id>，并打印执行上下文
-$circle /issue finish <id>    # 合并回基线分支并删除 circle/<id>
+$circle /issue start <id>     # 创建独立 worktree + circle/<id>，打印路径和执行上下文
+$circle /issue finish <id>    # 合并回基线分支并清理 worktree/分支
 ```
 
 `/issue start` 会拒绝被阻塞的 Issue、`done`/`cancelled` 的 Issue，以及工作树不干净的情况。它同时打印执行上下文：`AGENT.md`、`ARCHITECTURE.md`、`DOMAIN.md` 和当前 Issue 的完整内容。只想查看上下文而不创建分支时使用 `/issue context <id>`。
 
-勾选验收项会修改该 Issue 的事实文件，而 `/issue start` 与 `/issue finish` 都要求工作树干净，所以顺序是固定的：
+本地模式下，在返回的 worktree 中实现、勾选并提交验收项；Service 模式改为提交逐项结构化证据，并由 sync 回写事实。
 
 ```text
 实现 → /acceptance check 逐项勾选 → 在分支上 commit → /issue finish → /issue transition done
 ```
 
-如果先 finish 再勾选，勾选会变成基线分支上的未提交改动，下一次 `/issue start` 会因为工作树不干净而被拒绝。
-
-需要 Git 仓库，且项目根目录必须是该仓库的工作树根目录。基线分支由 `git config branch.circle/<id>.circlebase` 记录，随分支删除自动清理；也可以用 `/issue finish <id> --into <branch>` 显式指定。
+需要 Git 仓库，且项目根目录必须是主工作树根目录。基线分支、提交和 worktree 路径保存在 Git common dir 下的 Circle 元数据中，不依赖仅在单个克隆有效的 branch config；也可用 `/issue finish <id> --into <branch>` 显式指定目标分支。
 
 如果合并产生冲突，控制器会执行 `git merge --abort` 回到干净状态，并提示手动处理 `circle/<id>` 后重试，不会留下半合并状态。
 
@@ -242,6 +260,8 @@ draft → ready → in_progress → review → done
 ## 并发与 Git 协作
 
 每个 Issue 都保存一个从 `1` 开始的 `revision`。修改已有 Issue 时，Skill 会先读取当前 revision，并把它作为预期值提交给控制器；如果磁盘内容已经变化，控制器会拒绝陈旧写入，要求重新读取。
+
+锁使用系统临时目录中的独立文件，按规范化项目路径区分；初始化和修改共用一把锁，避免事实文档原子替换导致锁失效。锁文件不会写入 Git 工作树，也不会在释放时删除。该锁仅协调同一用户、同一临时目录下的本机进程，不是分布式锁。
 
 这个机制只保护当前工作树，不能自动解决不同 Git 分支间的冲突：
 
@@ -317,7 +337,7 @@ python3 -m unittest discover -s circle/tests -v
 
 当前版本不包含：
 
-- 自动执行或分派 Issue（agent 需要被显式要求执行）
+- 自动启动远程 Agent（可选 Service 已支持按依赖领取、租约、审核和最终验收；执行 Agent 仍需用户或外部运行器启动）
 - GitHub、Linear 或其他外部平台集成
 - GitHub 身份校验
 - 工期估算、格式校验与计算
@@ -326,3 +346,19 @@ python3 -m unittest discover -s circle/tests -v
 - Codex 原生 Slash Command 注册
 
 更完整的设计背景与验收标准见 [`plan.md`](plan.md)。
+
+## Windows 与协作实测
+
+本地适配和功能边界见 [WINDOWS_COLLABORATION_REPORT.md](WINDOWS_COLLABORATION_REPORT.md)。多机应使用各自独立的 Git 克隆，通过远端同步；不要依赖同步盘复制正在使用的工作树来实现互斥。
+
+## 架构图与中央协作 Service
+
+已从 Excalidraw 官方存储提取 Circle 对应区域，源更新时间为北京时间 2026-09-23 16:34:39。
+
+![Circle 源架构图预览](docs/architecture/circle-workflow-preview.png)
+
+[可编辑源图](docs/architecture/circle-workflow.excalidraw) · [来源记录](docs/architecture/source-metadata.json) · [Service 使用说明](circle/references/SERVICE.md)
+
+新增可选的中央 Service，提供 HTTP 任务领取、租约续期、指定人员 Review、独立最终验收，以及合入代码后的 Markdown 事实回写。数据库与令牌放在中央主机本地用户目录，各机器使用独立 Git 克隆。新增 `service.py`、`service_client.py`、`service_credentials.py` 均只依赖 Python 标准库。
+
+同时修复事实库校验遗漏：合并产生的重复标题、未勾选验收项却为 done 的任务，现在均被 validate 拒绝。前面的 Windows 协作报告是该修复之前的历史测试记录，最新结果见 [架构开发验收记录](docs/ARCHITECTURE_DEVELOPMENT.md)。

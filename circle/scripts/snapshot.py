@@ -32,7 +32,7 @@ from model import (
 )
 
 
-IMPORT_KEYS = ("project", "docs", "issues", "inferences", "warnings", "raw_summary")
+IMPORT_KEYS = ("project", "docs", "issues", "inferences", "warnings", "raw_summary", "requirement")
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -132,6 +132,32 @@ def normalize_import(
         )
     inferences.extend(f"docs.{field} 未提供，已写入占位内容" for field, _ in missing)
 
+    requirement_input = raw.get("requirement", {})
+    if not isinstance(requirement_input, dict):
+        raise CircleError("requirement must be an object")
+    unknown_requirement = sorted(set(requirement_input) - {
+        "source_channel", "source_locator", "requester", "confirmed_by", "supersedes"
+    })
+    if unknown_requirement:
+        raise CircleError("unknown requirement fields: " + ", ".join(unknown_requirement))
+    summary = normalize_body(raw.get("raw_summary", ""), "raw_summary") or description or name
+    source_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()
+    requirement_id = "REQ-" + source_hash[:12].upper()
+    recorded = now()
+    requirement = {
+        "id": requirement_id, "state": "confirmed",
+        "source_channel": normalize_text(requirement_input.get("source_channel", "direct"), "requirement.source_channel"),
+        "source_locator": normalize_text(requirement_input.get("source_locator", "preview-import"), "requirement.source_locator"),
+        "requester": normalize_text(requirement_input.get("requester", "user"), "requirement.requester"),
+        "recorded_at": recorded,
+        "confirmed_by": normalize_text(requirement_input.get("confirmed_by", "user"), "requirement.confirmed_by"),
+        "confirmed_at": recorded, "source_sha256": source_hash,
+        "supersedes": normalize_string_list(requirement_input.get("supersedes", []), "requirement.supersedes"),
+        "architecture_revision": hashlib.sha256(resolved["architecture"].encode("utf-8")).hexdigest(),
+        "issue_ids": [issue["id"] for issue in issues], "content": summary,
+    }
+    for issue in issues:
+        issue["requirement_ids"] = [requirement_id]
     snapshot = {
         "project_root": str(root.resolve()),
         "project": {"name": name, "description": description},
@@ -140,8 +166,9 @@ def normalize_import(
         "issue_keys": {issue_id: key for key, issue_id in issue_keys.items()},
         "inferences": inferences,
         "warnings": warnings,
-        "raw_summary": normalize_body(raw.get("raw_summary", ""), "raw_summary"),
-        "created_at": now(),
+        "raw_summary": summary,
+        "requirement": requirement,
+        "created_at": recorded,
     }
     snapshot["snapshot_hash"] = snapshot_hash(snapshot)
     return snapshot

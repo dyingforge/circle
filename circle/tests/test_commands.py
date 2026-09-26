@@ -16,7 +16,7 @@ class InitializationTest(CircleTestCase):
     def test_commit_writes_documents_and_structured_issues(self):
         ids = self.preview_commit()
         self.assertEqual(
-            {"AGENT.md", "ARCHITECTURE.md", "DOMAIN.md", "DAG.md", "issues"},
+            {"AGENT.md", "ARCHITECTURE.md", "DOMAIN.md", "DAG.md", "issues", "requirements"},
             {item.name for item in self.store.iterdir()},
         )
         agent = (self.store / "AGENT.md").read_text(encoding="utf-8")
@@ -34,6 +34,9 @@ class InitializationTest(CircleTestCase):
         self.assertIn('assignee: "A"', text)
         self.assertNotIn("estimate", text)
         self.circle("validate")
+        requirement=next((self.store/"requirements").glob("REQ-*.md")).read_text(encoding="utf-8")
+        self.assertIn("source_sha256:",requirement)
+        self.assertIn(ids["model"],requirement)
 
     def test_preview_leaves_the_project_untouched(self):
         preview = self.circle("preview", data=import_payload()).stdout
@@ -676,6 +679,16 @@ class BrokenStoreTest(CircleTestCase):
 
 
 class WorkBranchTest(CircleTestCase):
+    def test_two_issue_worktrees_can_exist_simultaneously(self):
+        ids=self.preview_commit();self.init_git()
+        extra=json.loads(self.circle("issue-add",data={"title":"Parallel","goal":"g","expected_behavior":"e","boundaries":"b","acceptance":["a"]}).stdout)
+        # Commit the new authoring fact before creating either isolated worktree.
+        self.git("add","-A");self.git("commit","-qm","parallel issue")
+        first=self.circle("issue-branch","--id",ids["model"]).stdout
+        second=self.circle("issue-branch","--id",extra["id"]).stdout
+        self.assertIn("worktree at",first);self.assertIn("worktree at",second)
+        self.assertEqual(2,self.git("worktree","list","--porcelain").count("branch refs/heads/circle/"))
+        self.circle("issue-finish","--id",ids["model"]);self.circle("issue-finish","--id",extra["id"])
     def test_creates_merges_and_deletes_the_branch(self):
         ids = self.preview_commit()
         model_id = ids["model"]
@@ -683,22 +696,20 @@ class WorkBranchTest(CircleTestCase):
         branch = f"circle/{model_id}"
 
         started = self.circle("issue-branch", "--id", model_id).stdout
-        self.assertIn(f"Created {branch} from main.", started)
+        self.assertIn(f"Created {branch} worktree", started)
         self.assertIn("## Execution context", started)
-        self.assertEqual(branch, self.git("rev-parse", "--abbrev-ref", "HEAD"))
-        self.assertEqual("main", self.git("config", "--local", "--get", f"branch.{branch}.circlebase"))
+        path = Path(re.search(r"worktree at (.+) from [0-9a-f]+", started).group(1))
+        self.assertEqual("main", self.git("rev-parse", "--abbrev-ref", "HEAD"))
 
-        (self.root / "implementation.txt").write_text("work\n", encoding="utf-8")
-        self.git("add", "-A")
-        self.git("commit", "-qm", "implement model")
+        (path / "implementation.txt").write_text("work\n", encoding="utf-8")
+        support.subprocess.run(["git","add","-A"],cwd=path,check=True)
+        support.subprocess.run(["git","commit","-qm","implement model"],cwd=path,check=True)
 
         finished = self.circle("issue-finish", "--id", model_id).stdout
-        self.assertIn(f"Merged {branch} into main and deleted {branch}.", finished)
+        self.assertIn(f"Merged {branch} into main", finished)
         self.assertEqual("main", self.git("rev-parse", "--abbrev-ref", "HEAD"))
         self.assertTrue((self.root / "implementation.txt").is_file())
         self.assertEqual("", self.git("branch", "--list", branch))
-        self.assertEqual(
-            "", self.git("config", "--local", "--get", f"branch.{branch}.circlebase", expect=1))
 
     def test_refuses_dirty_tree_blocked_issue_and_wrong_branch(self):
         ids = self.preview_commit()
@@ -713,15 +724,12 @@ class WorkBranchTest(CircleTestCase):
         self.assertIn("unfinished blockers", self.rejected("issue-branch", "--id", dag_id))
 
         self.circle("issue-branch", "--id", model_id)
-        self.assertIn("Already on", self.circle("issue-branch", "--id", model_id).stdout)
+        self.assertIn("Already prepared", self.circle("issue-branch", "--id", model_id).stdout)
 
         self.assertIn("does not exist", self.rejected("issue-finish", "--id", dag_id))
-        self.git("checkout", "-q", "main")
-        self.assertIn("check out", self.rejected("issue-finish", "--id", model_id))
-        self.assertIn("already exists", self.rejected("issue-branch", "--id", model_id))
-
-        (self.root / "work.txt").write_text("x\n", encoding="utf-8")
-        self.git("checkout", "-q", branch)
+        output = self.circle("issue-branch", "--id", model_id).stdout
+        path = Path(re.search(r"at (.+)\.", output.splitlines()[0]).group(1))
+        (path / "work.txt").write_text("x\n", encoding="utf-8")
         self.assertIn("uncommitted changes", self.rejected("issue-finish", "--id", model_id))
 
     def test_finish_honours_into_and_reports_an_unknown_base(self):
@@ -729,14 +737,11 @@ class WorkBranchTest(CircleTestCase):
         model_id = ids["model"]
         branch = f"circle/{model_id}"
         self.init_git()
-        self.circle("issue-branch", "--id", model_id)
-        (self.root / "work.txt").write_text("x\n", encoding="utf-8")
-        self.git("add", "-A")
-        self.git("commit", "-qm", "work")
-
-        self.git("config", "--local", "--unset", f"branch.{branch}.circlebase")
-        self.assertIn("unknown", self.rejected("issue-finish", "--id", model_id))
-
+        started=self.circle("issue-branch", "--id", model_id).stdout
+        path=Path(re.search(r"worktree at (.+) from [0-9a-f]+",started).group(1))
+        (path / "work.txt").write_text("x\n", encoding="utf-8")
+        support.subprocess.run(["git","add","-A"],cwd=path,check=True)
+        support.subprocess.run(["git","commit","-qm","work"],cwd=path,check=True)
         self.circle("issue-finish", "--id", model_id, "--into", "main")
         self.assertEqual("main", self.git("rev-parse", "--abbrev-ref", "HEAD"))
         self.assertTrue((self.root / "work.txt").is_file())
@@ -751,6 +756,13 @@ class WorkBranchTest(CircleTestCase):
     def test_branch_is_refused_outside_a_git_repository(self):
         ids = self.preview_commit()
         self.assertIn("not a git work tree", self.rejected("issue-branch", "--id", ids["model"]))
+
+    def test_dependency_commit_preflight(self):
+        self.preview_commit();self.init_git();head=self.git("rev-parse","HEAD")
+        from workbranch import preflight
+        self.assertEqual(head,preflight(self.root,head,{"dep":head})["head"])
+        with self.assertRaisesRegex(Exception,"missing dependency dep commit"):
+            preflight(self.root,head,{"dep":"a"*40})
 
 
 if __name__ == "__main__":

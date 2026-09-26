@@ -1,0 +1,31 @@
+{
+  "kind": "two simulated users, concurrent HTTP claims, two worktrees, one merge/sync",
+  "concurrent_claims": {
+    "alice": {
+      "issue": "CIR-E0V6VQV8MU",
+      "owner": "alice",
+      "attempt": 1
+    },
+    "bob": {
+      "issue": "CIR-LMBMVGVDVB",
+      "owner": "bob",
+      "attempt": 1
+    }
+  },
+  "commits": {
+    "alice": "27a171239c14cb2131bc6b96e5f0988ff12155d5",
+    "bob": "6dbcf92f989bee11482ffede9cc4a8e21b7b352f"
+  },
+  "worktrees_existed_simultaneously": true,
+  "merged_and_synced": {
+    "synced": 2,
+    "files": [
+      "alice-feature.txt",
+      "bob-feature.txt"
+    ],
+    "issues_done": [
+      "CIR-E0V6VQV8MU",
+      "CIR-LMBMVGVDVB"
+    ]
+  }
+}

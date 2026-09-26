@@ -1,0 +1,145 @@
+{
+  "kind": "local HTTP + real Git integration, not physical multi-machine",
+  "commit": "84dde5327b461d129daf1471a2cac4dc50139608",
+  "completed": {
+    "id": "CIR-FH1XFYAVGM",
+    "source": {
+      "id": "CIR-FH1XFYAVGM",
+      "title": "Model",
+      "state": "ready",
+      "assignee": null,
+      "blocked_by": [],
+      "revision": 1,
+      "created_at": "2026-09-23T15:41:10+00:00",
+      "updated_at": "2026-09-23T15:41:10+00:00",
+      "goal": "Model 的目标。",
+      "expected_behavior": "Model 的预期行为。",
+      "boundaries": "无",
+      "acceptance": [
+        {
+          "text": "Model 可以通过验收",
+          "done": false
+        }
+      ],
+      "comments": ""
+    },
+    "source_hash": "42d8ef12f3eac40582549e93a23132e0530d4b822fbf903db682d44bea5621f9",
+    "docs": {
+      "AGENT.md": "---\nname: \"Demo\"\ncreated_at: \"2026-09-23T15:41:10+00:00\"\n---\n\n三个 Issue 的验收项目。\n\n## 工作约定\n\n- 修改前先读 ARCHITECTURE.md\n",
+      "ARCHITECTURE.md": "# Demo: Architecture\n\n控制器 + 事实库。\n",
+      "DOMAIN.md": "# Demo: Domain\n\nGoal / Acceptance / Blocker / Actionable。\n"
+    },
+    "state": "done",
+    "owner": "alice",
+    "attempt": 1,
+    "lease_until": null,
+    "version": 6,
+    "reviewer": "reviewer",
+    "submission": {
+      "commit": "84dde5327b461d129daf1471a2cac4dc50139608",
+      "evidence": [
+        "tests/result.txt"
+      ],
+      "checked_items": [
+        1
+      ],
+      "worker": "alice",
+      "attempt": 1
+    },
+    "review": {
+      "reviewer": "reviewer",
+      "decision": "approve",
+      "note": "reviewed fixture and evidence",
+      "commit": "84dde5327b461d129daf1471a2cac4dc50139608"
+    },
+    "acceptance": {
+      "actor": "owner",
+      "note": "final acceptance",
+      "commit": "84dde5327b461d129daf1471a2cac4dc50139608",
+      "at": 1790178072.0542932
+    }
+  },
+  "released": "CIR-P3PBFG6LYC",
+  "events": [
+    {
+      "seq": 10,
+      "at": 1790178073.8415663,
+      "actor": "bob",
+      "issue": "CIR-P3PBFG6LYC",
+      "action": "claim",
+      "version": 2
+    },
+    {
+      "seq": 9,
+      "at": 1790178073.484734,
+      "actor": "publisher",
+      "issue": "CIR-FH1XFYAVGM",
+      "action": "sync",
+      "version": 7
+    },
+    {
+      "seq": 8,
+      "at": 1790178072.05489,
+      "actor": "owner",
+      "issue": "CIR-FH1XFYAVGM",
+      "action": "accept",
+      "version": 6
+    },
+    {
+      "seq": 7,
+      "at": 1790178072.0476875,
+      "actor": "reviewer",
+      "issue": "CIR-FH1XFYAVGM",
+      "action": "review",
+      "version": 5
+    },
+    {
+      "seq": 6,
+      "at": 1790178072.0411463,
+      "actor": "owner",
+      "issue": "CIR-FH1XFYAVGM",
+      "action": "assign",
+      "version": 4
+    },
+    {
+      "seq": 5,
+      "at": 1790178072.0044296,
+      "actor": "alice",
+      "issue": "CIR-FH1XFYAVGM",
+      "action": "submit",
+      "version": 3
+    },
+    {
+      "seq": 4,
+      "at": 1790178071.021296,
+      "actor": "alice",
+      "issue": "CIR-FH1XFYAVGM",
+      "action": "claim",
+      "version": 2
+    },
+    {
+      "seq": 3,
+      "at": 1790178070.5585337,
+      "actor": "publisher",
+      "issue": "CIR-P3PBFG6LYC",
+      "action": "publish",
+      "version": 1
+    },
+    {
+      "seq": 2,
+      "at": 1790178070.5585337,
+      "actor": "publisher",
+      "issue": "CIR-FH1XFYAVGM",
+      "action": "publish",
+      "version": 1
+    },
+    {
+      "seq": 1,
+      "at": 1790178070.5585337,
+      "actor": "publisher",
+      "issue": "CIR-3NM6KU0VOF",
+      "action": "publish",
+      "version": 1
+    }
+  ]
+}
