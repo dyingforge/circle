@@ -13,20 +13,21 @@ import model
 from errors import CircleError
 
 
-def issue_dict(issue_id="CIR-ABCDEFGHIJ", title="标题", state="draft", blocked_by=(), **extra):
+def issue_dict(issue_id="CIR-ABCDEFGHIJ", title=None, state="draft", blocked_by=(), **extra):
     issue = {
         "id": issue_id,
-        "title": title,
+        "title": title if title is not None else ("标题" if issue_id == "CIR-ABCDEFGHIJ" else issue_id),
         "state": state,
         "assignee": None,
         "blocked_by": list(blocked_by),
+        "requirement_ids": [],
         "revision": 1,
         "created_at": "2026-01-01T00:00:00+00:00",
         "updated_at": "2026-01-01T00:00:00+00:00",
         "goal": "目标。",
         "expected_behavior": "预期行为。",
         "boundaries": "无。",
-        "acceptance": [{"text": "可以验收", "done": False}],
+        "acceptance": [{"text": "可以验收", "done": state == "done"}],
         "comments": "",
     }
     issue.update(extra)
@@ -60,6 +61,10 @@ class StoreTestCase(unittest.TestCase):
 
 
 class NormalizationTest(unittest.TestCase):
+    def test_acceptance_done_requires_a_real_boolean(self):
+        for value in ("false", 0, 1, None):
+            with self.subTest(value=value), self.assertRaisesRegex(CircleError, "must be a boolean"):
+                model.normalize_acceptance([{"text": "x", "done": value}], "acceptance")
     def test_normalize_text_strips_and_rejects(self):
         self.assertEqual("value", model.normalize_text("  value  ", "field"))
         for bad in ("", "   ", None, 7, []):
@@ -290,6 +295,9 @@ class GraphPredicateTest(unittest.TestCase):
 
 
 class ValidateGraphTest(unittest.TestCase):
+    def test_duplicate_titles_are_case_insensitive(self):
+        issues={"CIR-ABCDEFGHIJ":issue_dict(title="Task"),"CIR-1234567890":issue_dict("CIR-1234567890",title="task")}
+        with self.assertRaisesRegex(CircleError,"duplicate issue title"):model.validate_graph(issues)
     def test_rejects_structural_problems(self):
         cases = {
             "unknown blocker": {

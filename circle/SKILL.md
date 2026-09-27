@@ -181,10 +181,10 @@ After `.circle/` exists, a later document or pasted text can add issues without 
 When the user asks to execute, implement, or start an issue, follow this procedure:
 
 1. Check with `issue-show` that the issue is unblocked and not `done` or `cancelled`.
-2. Run `issue-branch --id <id>`. It creates `circle/<id>` from the current branch, records the base branch, and prints the execution context.
+2. Run `issue-branch --id <id>`. It creates an isolated worktree for `circle/<id>`, records base metadata under the Git common directory, and prints the worktree path plus execution context. Perform implementation and commits in that returned path.
 3. Read only the documents the context lists: `.circle/AGENT.md`, `.circle/ARCHITECTURE.md`, `.circle/DOMAIN.md`, and the issue file. Use `.circle/AGENT.md` for project conventions and `.circle/DOMAIN.md` for vocabulary. Use `issue-context --id <id>` alone when you only need the bundle without creating a branch.
 4. Implement the issue on that branch and commit there as usual. The controller never implements anything for you.
-5. Verify each acceptance criterion and tick it with `acceptance-check --id <id> --item <n> --expected-revision <revision>`, one `--item` per criterion. Commit that change on the branch: ticking edits the issue file, and `issue-finish` refuses to run with uncommitted changes. Ticking before finishing is what carries the checkboxes into the merged result.
+5. In local mode, verify each acceptance criterion in the worktree and tick it there. In Service mode submit structured evidence for every criterion and leave local execution facts locked until sync.
 6. Run `issue-finish --id <id>`. It merges `circle/<id>` back into the branch it was created from and deletes it. Pass `--into <branch>` only when the recorded base branch is gone.
 7. Advance the issue with `issue-transition`, for example `in_progress` → `review` → `done`. The transition to `done` is refused while any acceptance criterion is still unchecked.
 
@@ -196,7 +196,29 @@ Rules for this workflow:
 - If `issue-finish` reports a conflict it has already aborted the merge. Reconcile `circle/<id>` manually, then retry.
 - Do not leave an issue branch behind: finish it, or tell the user it is still open.
 
-## Interpret status
+## Optional central Service mode
+
+When the user explicitly asks to use a configured Circle Service, read
+`references/SERVICE.md`. Do not infer a server URL or credentials. Obtain the token from
+the user's configured private token file or `CIRCLE_SERVICE_TOKEN`, never a
+tracked project file, command-line token argument, or chat message.
+
+Use `scripts/service_client.py` to read the selected task context and claim it
+before implementation. Match the published source issue/revision with the local
+checkout, fetch completed dependency code, and use one issue branch in that
+machine's independent Git clone. Renew the returned attempt before lease expiry;
+stop execution if renewal fails or the lease is lost. Submit the real full commit
+hash and structured evidence bound to that commit, with every acceptance item accounted for. Run `service_preflight.py` against the claimed task before starting.
+
+The configured reviewer reviews independently; the owner performs final
+acceptance. Never impersonate their identities or approve your own implementation.
+The service does not execute agents. It validates evidence schema, criterion coverage, commit binding and locally visible hashes. In Service
+mode, do not use local acceptance/transition commands to complete the same issue:
+after code is merged, the central maintainer runs `service.py ... sync`, validates,
+renders and commits the resulting facts. Local-only projects keep the original
+workflow above.
+
+## Interpret local status
 
 - Advance issues only along `draft → ready → in_progress → review → done`.
 - Allow any non-terminal issue to transition to `cancelled`; restore `cancelled` only to `draft`.

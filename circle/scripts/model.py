@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
-import fcntl
-import os
+import json
 from pathlib import Path
 import re
 import secrets
@@ -19,6 +18,7 @@ from typing import Any, Iterator
 
 from document import atomic_write, parse_document, parse_sections, write_document, write_text
 from errors import CircleError
+from locking import project_lock
 from graph import (
     DONE,
     READY,
@@ -30,6 +30,8 @@ from graph import (
 
 STORE_DIR = ".circle"
 ISSUES_DIR = "issues"
+REQUIREMENTS_DIR = "requirements"
+PUBLICATION_FILE = "PUBLICATION.json"
 AGENT_DOC = "AGENT.md"
 ARCHITECTURE_DOC = "ARCHITECTURE.md"
 DOMAIN_DOC = "DOMAIN.md"
@@ -51,7 +53,7 @@ ID_SUFFIX_LENGTH = 10
 ID_ALPHABET = string.ascii_uppercase + string.digits
 
 FRONT_MATTER_FIELDS = (
-    "id", "title", "state", "assignee", "blocked_by", "revision", "created_at", "updated_at",
+    "id", "title", "state", "assignee", "blocked_by", "requirement_ids", "revision", "created_at", "updated_at",
 )
 CONTENT_FIELDS = ("goal", "expected_behavior", "boundaries", "acceptance")
 PROSE_SECTIONS = (
@@ -63,7 +65,7 @@ ACCEPTANCE_SECTION = "Acceptance Criteria"
 COMMENTS_SECTION = "Comments"
 KNOWN_SECTIONS = tuple(heading for heading, _ in PROSE_SECTIONS) + (ACCEPTANCE_SECTION, COMMENTS_SECTION)
 
-EDITABLE_FIELDS = ("title",) + CONTENT_FIELDS + ("assignee", "blocked_by")
+EDITABLE_FIELDS = ("title",) + CONTENT_FIELDS + ("assignee", "blocked_by", "requirement_ids")
 IMMUTABLE_WHEN_DONE = tuple(field for field in EDITABLE_FIELDS if field != "assignee")
 CREATION_FIELDS = EDITABLE_FIELDS + ("state",)
 IMPORT_FIELDS = ("key",) + CREATION_FIELDS
@@ -98,6 +100,10 @@ def issues_dir(root: Path) -> Path:
 
 def issue_path(root: Path, issue_id: str) -> Path:
     return issues_dir(root) / f"{issue_id}.md"
+
+
+def requirements_dir(root: Path) -> Path:
+    return store_path(root) / REQUIREMENTS_DIR
 
 
 def require_store(root: Path) -> Path:
@@ -169,7 +175,10 @@ def normalize_acceptance(value: Any, field: str) -> list[dict[str, Any]]:
             unknown = sorted(set(item) - {"text", "done"})
             if unknown:
                 raise CircleError(f"unknown keys in {label}: {', '.join(unknown)}")
-            text, done = item.get("text"), bool(item.get("done", False))
+            text = item.get("text")
+            if "done" in item and type(item["done"]) is not bool:
+                raise CircleError(f"{label}.done must be a boolean")
+            done = item.get("done", False)
         else:
             raise CircleError(f"{label} must be a string or an object")
         result.append({"text": normalize_text(text, f"{label}.text"), "done": done})
@@ -216,7 +225,7 @@ def acceptance_indices(issue: dict[str, Any], requested: list[int]) -> set[int]:
 
 
 def issue_fields(issue: dict[str, Any]) -> list[tuple[str, Any]]:
-    return [(field, issue[field]) for field in FRONT_MATTER_FIELDS]
+    return [(field, issue.get(field, []) if field == "requirement_ids" else issue[field]) for field in FRONT_MATTER_FIELDS]
 
 
 def acceptance_line(item: dict[str, Any]) -> str:
@@ -247,7 +256,9 @@ def write_issue_to(path: Path, issue: dict[str, Any]) -> None:
 
 def load_issue(path: Path) -> dict[str, Any]:
     data, body = parse_document(path)
-    missing = sorted(set(FRONT_MATTER_FIELDS) - data.keys())
+    # requirement_ids was added after the first on-disk format and defaults to
+    # an empty provenance set when reading an older store.
+    missing = sorted(set(FRONT_MATTER_FIELDS) - {"requirement_ids"} - data.keys())
     if missing:
         raise CircleError(f"missing issue fields in {path}: {', '.join(missing)}")
     unknown = sorted(set(data) - set(FRONT_MATTER_FIELDS))
@@ -260,6 +271,7 @@ def load_issue(path: Path) -> dict[str, Any]:
         "state": data["state"],
         "assignee": optional_text(data["assignee"], "assignee"),
         "blocked_by": normalize_blockers(data["blocked_by"]),
+        "requirement_ids": normalize_string_list(data.get("requirement_ids", []), "requirement_ids"),
         "revision": data["revision"],
         "created_at": data["created_at"],
         "updated_at": data["updated_at"],
@@ -301,6 +313,69 @@ def load_issues(store: Path) -> dict[str, dict[str, Any]]:
             raise CircleError(f"issue filename does not match ID: {path}")
         issues[issue["id"]] = issue
     return issues
+
+
+# --------------------------------------------------------------------------
+# Requirement provenance
+# --------------------------------------------------------------------------
+
+REQUIREMENT_FIELDS = (
+    "id", "state", "source_channel", "source_locator", "requester",
+    "recorded_at", "confirmed_by", "confirmed_at", "source_sha256",
+    "supersedes", "architecture_revision", "issue_ids",
+)
+
+
+def write_requirement(store: Path, requirement: dict[str, Any]) -> None:
+    path = store / REQUIREMENTS_DIR / f"{requirement['id']}.md"
+    write_document(path, [(key, requirement[key]) for key in REQUIREMENT_FIELDS], requirement["content"])
+
+
+def load_requirements(store: Path) -> dict[str, dict[str, Any]]:
+    directory = store / REQUIREMENTS_DIR
+    if not directory.exists():
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for path in sorted(directory.glob("REQ-*.md")):
+        fields, content = parse_document(path)
+        if set(fields) != set(REQUIREMENT_FIELDS):
+            raise CircleError(f"invalid requirement fields in {path}")
+        requirement_id = fields["id"]
+        if not isinstance(requirement_id, str) or not re.fullmatch(r"REQ-[0-9A-F]{12}", requirement_id):
+            raise CircleError(f"invalid requirement ID in {path}")
+        if path.name != f"{requirement_id}.md" or requirement_id in result:
+            raise CircleError(f"requirement filename or ID mismatch: {path}")
+        if fields["state"] not in {"confirmed", "rejected", "superseded"}:
+            raise CircleError(f"invalid requirement state in {path}")
+        if not content.strip():
+            raise CircleError(f"requirement content must not be empty in {path}")
+        for key in ("supersedes", "issue_ids"):
+            fields[key] = normalize_string_list(fields[key], key)
+        result[requirement_id] = dict(fields, content=content.strip())
+    return result
+
+
+def publication_metadata(store: Path) -> dict[str, Any] | None:
+    path = store / PUBLICATION_FILE
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise CircleError(f"invalid {PUBLICATION_FILE}") from exc
+    if not isinstance(value, dict) or value.get("execution_mode") != "service":
+        raise CircleError(f"invalid {PUBLICATION_FILE}")
+    return value
+
+
+def write_publication_metadata(store: Path, value: dict[str, Any]) -> None:
+    atomic_write(store / PUBLICATION_FILE, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def require_authoring_mutable(store: Path, issue_id: str | None = None) -> None:
+    metadata = publication_metadata(store)
+    if metadata and (issue_id is None or issue_id in metadata.get("issues", {})):
+        raise CircleError("published Service facts are execution-locked; use Service actions and sync")
 
 
 # --------------------------------------------------------------------------
@@ -362,13 +437,17 @@ def create_store(
     created_at: str,
     docs: dict[str, str],
     issues: list[dict[str, Any]],
+    requirements: list[dict[str, Any]] | None = None,
 ) -> None:
     """Materialise a whole fact store under `store`, which must not exist yet."""
     (store / ISSUES_DIR).mkdir(parents=True)
+    (store / REQUIREMENTS_DIR).mkdir(parents=True)
     for field, _ in DOCUMENTS:
         write_project_document(store, field, docs[field], name=name, created_at=created_at)
     for issue in issues:
         write_issue_to(store / ISSUES_DIR / f"{issue['id']}.md", issue)
+    for requirement in requirements or []:
+        write_requirement(store, requirement)
     write_dag(store, {issue["id"]: issue for issue in issues})
 
 
@@ -380,6 +459,11 @@ def load_store(store: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """Load and fully validate a fact store. `store` is a resolved `.circle` path."""
     project = load_project(store)
     issues = load_issues(store)
+    requirements = load_requirements(store)
+    for issue in issues.values():
+        unknown = sorted(set(issue["requirement_ids"]) - set(requirements))
+        if unknown:
+            raise CircleError(f"unknown requirement on {issue['id']}: {', '.join(unknown)}")
     validate_graph(issues)
     return project, issues
 
@@ -405,7 +489,14 @@ def check_revision(issue: dict[str, Any], expected: int) -> None:
 
 def validate_graph(issues: dict[str, dict[str, Any]]) -> None:
     known = set(issues)
+    titles: set[str] = set()
     for issue_id, issue in issues.items():
+        title = issue["title"].strip().casefold()
+        if title in titles:
+            raise CircleError(f"duplicate issue title: {title}")
+        titles.add(title)
+        if issue["state"] == DONE and not all(item["done"] for item in issue["acceptance"]):
+            raise CircleError(f"unchecked acceptance criteria on done issue: {issue_id}")
         for blocker in issue["blocked_by"]:
             if blocker not in known:
                 raise CircleError(f"unknown blocker {blocker} on {issue_id}")
@@ -476,6 +567,7 @@ def build_issue(
         "state": state,
         "assignee": optional_text(data.get("assignee"), f"{label}.assignee"),
         "blocked_by": blocked_by,
+        "requirement_ids": normalize_string_list(data.get("requirement_ids", []), f"{label}.requirement_ids"),
         "revision": 1,
         "created_at": created,
         "updated_at": created,
@@ -598,25 +690,12 @@ def render_dag(issues: dict[str, dict[str, Any]]) -> str:
 # Locks
 # --------------------------------------------------------------------------
 
-@contextlib.contextmanager
-def root_lock(root: Path) -> Iterator[None]:
-    """Serialise store creation against other commits into the same root."""
-    fd = os.open(root, os.O_RDONLY)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+# Initialization and mutations share a stable lock outside the tracked files.
+root_lock = project_lock
 
 
 @contextlib.contextmanager
 def store_lock(root: Path) -> Iterator[Path]:
-    """Serialise mutations on one fact store, yielding the resolved store path."""
-    store = require_store(root)
-    with (store / AGENT_DOC).open("r", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield store
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    """Serialise mutations on one local fact store."""
+    with project_lock(root):
+        yield require_store(root)

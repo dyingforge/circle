@@ -31,6 +31,7 @@ def run_circle(root, command, *args, data=None, stdin=None):
         [sys.executable, str(ENTRY), "--project-root", str(root), command, *args],
         input=stdin if stdin is not None else (None if data is None else json.dumps(data)),
         text=True,
+        encoding="utf-8",
         capture_output=True,
     )
 
